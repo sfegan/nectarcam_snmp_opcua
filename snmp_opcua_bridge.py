@@ -20,7 +20,8 @@ Each SNMPPoller is built from a dict like:
         "ip":        "192.168.1.10",
         "port":      161,
         "community": "public",
-        "opcua_path": "Monitoring.Switch01",   # dot-separated hierarchy
+        "description": "Main distribution switch, rack A",
+        "opcua_path": "Switch01",              # relative to SNMPDevices/
         "poll_interval": 10,                   # seconds
         "oids": [
             {
@@ -205,7 +206,8 @@ class SNMPPoller:
     ip: str
     port: int
     community: str
-    opcua_path: str           # dot-separated, e.g. "Monitoring.Switch01"
+    description: str          # human-readable device description (written to OPC UA object)
+    opcua_path: str           # dot-separated path relative to SNMPDevices/, e.g. "Switch01"
     poll_interval: float      # seconds
     oids: List[OIDConfig]
 
@@ -225,6 +227,7 @@ class SNMPPoller:
             ip=cfg["ip"],
             port=int(cfg.get("port", 161)),
             community=cfg["community"],
+            description=cfg.get("description", ""),
             opcua_path=cfg["opcua_path"],
             poll_interval=float(cfg.get("poll_interval", 10)),
             oids=oids,
@@ -263,16 +266,36 @@ class SNMPPoller:
 
     async def run(self) -> None:
         """
-        Main polling loop.  Must be called after the OPC UA nodes have been
-        created (i.e. after OPCUAServer.build_address_space()).
+        Phase-locked polling loop.  Must be called after the OPC UA nodes have
+        been created (i.e. after OPCUAServer.build_address_space()).
+
+        The first poll fires immediately and its wall-clock time is recorded as
+        the phase origin.  Every subsequent deadline is origin + N * interval,
+        so accumulated drift from poll latency is corrected each cycle rather
+        than compounding.  If a poll overruns its slot the next sleep is simply
+        zero (we never skip a cycle).
         """
         log.info("Poller started: %s  path=%s  interval=%.1fs",
                  self.ip, self.opcua_path, self.poll_interval)
+
+        loop = asyncio.get_running_loop()
+        origin = loop.time()          # phase reference: time of first poll
+        cycle = 0
+
         while True:
             online = await self._poll_once()
             state_val = ua.Variant(1 if online else 0, ua.VariantType.Byte)
             await self._state_node.write_value(state_val)
-            await asyncio.sleep(self.poll_interval)
+
+            cycle += 1
+            next_deadline = origin + cycle * self.poll_interval
+            sleep_for = next_deadline - loop.time()
+            if sleep_for > 0:
+                await asyncio.sleep(sleep_for)
+            else:
+                # Poll overran its slot — log and continue immediately
+                log.warning("Poller %s overran slot by %.3fs (cycle %d)",
+                            self.ip, -sleep_for, cycle)
 
     async def _poll_once(self) -> bool:
         """
@@ -396,9 +419,38 @@ class OPCUAServer:
 
     async def _build_address_space(self, server: Server, ns_idx: int) -> None:
         """Create all OPC UA nodes for every registered poller."""
+        # Ensure the fixed SNMPDevices root object exists
+        snmp_devices_node = await self._ensure_path(server, ns_idx, ["SNMPDevices"])
+
         for poller in self._pollers:
+            # opcua_path is relative to SNMPDevices/
             parts = poller.opcua_path.split(".")
-            device_node = await self._ensure_path(server, ns_idx, parts)
+            # Build the device node under SNMPDevices
+            device_node = snmp_devices_node
+            for part in parts:
+                found = None
+                try:
+                    for child in await device_node.get_children():
+                        if await child.read_browse_name() == ua.QualifiedName(part, ns_idx):
+                            found = child
+                            break
+                except Exception:
+                    pass
+                if found is None:
+                    found = await device_node.add_object(ns_idx, part)
+                device_node = found
+
+            # ── device description on the object node ─────────────────────────
+            if poller.description:
+                await device_node.write_attribute(
+                    ua.AttributeIds.Description,
+                    ua.DataValue(
+                        ua.Variant(
+                            ua.LocalizedText(poller.description),
+                            ua.VariantType.LocalizedText,
+                        )
+                    ),
+                )
 
             # ── built-in variables ────────────────────────────────────────────
             host_node = await device_node.add_variable(
@@ -537,7 +589,8 @@ EXAMPLE_CONFIGS = [
         "ip":            "127.0.0.1",
         "port":          1161,
         "community":     "public",
-        "opcua_path":    "Monitoring.Localhost",
+        "description":   "Local test SNMP agent (net-snmp on localhost)",
+        "opcua_path":    "Localhost",
         "poll_interval": 10,
         "oids": [
             {
