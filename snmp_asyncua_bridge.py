@@ -1,11 +1,11 @@
 """
-snmp_opcua_bridge.py
+snmp_asyncua_bridge.py
 ────────────────────
 SNMP → OPC UA bridge using pysnmp (SNMPv2c) and asyncua.
 
 Usage
 -----
-python snmp_opcua_bridge.py \
+python snmp_asyncua_bridge.py \
     --opcua-endpoint opc.tcp://0.0.0.0:4840/nectarcam/ \
     --opcua-namespace http://cta-observatory.org/nectarcam/snmpdevices/ \
     --opcua-user admin:secret \
@@ -100,7 +100,7 @@ except ImportError:
 # ─────────────────────────────────────────────────────────────────────────────
 
 def setup_logging(level: str, log_file: Optional[str]) -> logging.Logger:
-    logger = logging.getLogger("snmp_opcua_bridge")
+    logger = logging.getLogger("snmp_asyncua_bridge")
     logger.setLevel(getattr(logging, level.upper(), logging.INFO))
     fmt = logging.Formatter(
         "%(asctime)s  %(levelname)-8s  %(name)s  %(message)s",
@@ -117,7 +117,7 @@ def setup_logging(level: str, log_file: Optional[str]) -> logging.Logger:
     return logger
 
 
-log = logging.getLogger("snmp_opcua_bridge")
+log = logging.getLogger("snmp_asyncua_bridge")
 
 # ─────────────────────────────────────────────────────────────────────────────
 # Type mapping:  OPC UA type name  →  (ua.VariantType,  Python cast)
