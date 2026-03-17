@@ -262,15 +262,12 @@ class SNMPPoller:
         # Detect duplicate opcua_name values within this poller's OID list.
         # Duplicates would silently overwrite each other's OPC UA node.
         seen: set[str] = set()
-        dupes = [
-            o.opcua_name for o in self.oids
-            if o.opcua_name in seen or seen.add(o.opcua_name)  # type: ignore[func-returns-value]
-        ]
-        if dupes:
-            raise ValueError(
-                f"Duplicate opcua_name(s) in poller {self.opcua_path!r}: "
-                f"{sorted(set(dupes))}"
-            )
+        for o in self.oids:
+            if o.opcua_name in seen:
+                raise ValueError(
+                    f"Duplicate opcua_name {o.opcua_name!r} in poller {self.opcua_path!r}"
+                )
+            seen.add(o.opcua_name)
 
     @classmethod
     def from_dict(cls, cfg: dict) -> "SNMPPoller":
