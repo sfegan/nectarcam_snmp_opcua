@@ -17,18 +17,18 @@ Configuration example
 Each SNMPPoller is built from a dict like:
 
     {
-        "ip":        "192.168.1.10",
-        "port":      161,
-        "community": "public",
-        "description": "Main distribution switch, rack A",
-        "opcua_path": "Switch01",              # relative to SNMPDevices/
-        "poll_interval": 10,                   # seconds
+        "ip":          "192.168.1.10",
+        "port":        161,             # optional, defaults to 161
+        "community":   "public",        # optional, defaults to "public"
+        "description": "Main distribution switch, rack A",  # optional, defaults to ""
+        "opcua_path":  "Switch01",      # relative to SNMPDevices/
+        "poll_interval": 10,            # optional, defaults to 10 (seconds)
         "oids": [
             {
                 "oid":         "1.3.6.1.2.1.1.1.0",   # sysDescr
                 "opcua_name":  "sysDescr",
                 "opcua_type":  "String",
-                "description": "System description",
+                "description": "System description",   # optional, defaults to ""
             },
             {
                 "oid":         "1.3.6.1.2.1.1.3.0",   # sysUpTime
@@ -276,7 +276,7 @@ class SNMPPoller:
         return cls(
             ip=cfg["ip"],
             port=int(cfg.get("port", 161)),
-            community=cfg["community"],
+            community=cfg.get("community", "public"),
             description=cfg.get("description", ""),
             opcua_path=cfg["opcua_path"],
             poll_interval=float(cfg.get("poll_interval", 10)),
