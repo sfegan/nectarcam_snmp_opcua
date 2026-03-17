@@ -49,6 +49,7 @@ from __future__ import annotations
 
 import argparse
 import asyncio
+import json
 import logging
 import logging.handlers
 import sys
@@ -140,11 +141,6 @@ _UA_TYPE_MAP: Dict[str, tuple[ua.VariantType, Any]] = {
 }
 
 
-# Sentinel stored in _oid_key_cache for OIDs the device does not support
-_UNSUPPORTED     = "_UNSUPPORTED_"      # bad OID, null already written — skip each cycle
-_UNSUPPORTED_NEW = "_UNSUPPORTED_NEW_"  # just discovered bad — write null once then demote to _UNSUPPORTED
-
-
 def _snmp_value_to_python(raw_value: Any) -> Any:
     """Convert a pysnmp value object to a plain Python value."""
     if isinstance(raw_value, (Integer, Integer32, TimeTicks,
@@ -162,15 +158,25 @@ def _snmp_value_to_python(raw_value: Any) -> Any:
     return raw_value.prettyPrint()
 
 
-def _cast_to_ua(value: Any, opcua_type: str) -> ua.Variant:
-    """Cast a Python value to the requested OPC UA Variant."""
+def _cast_to_ua(value: Any, opcua_type: str) -> ua.DataValue | ua.Variant:
+    """
+    Cast a Python value to the requested OPC UA Variant.
+
+    Returns a ua.Variant on success.  On cast failure returns a ua.DataValue
+    with status BadDataEncodingInvalid so OPC UA clients see a proper error
+    status rather than a silently mis-typed String value written to a node
+    that was declared with a different type.
+    """
     variant_type, cast_fn = _UA_TYPE_MAP[opcua_type]
     try:
         return ua.Variant(cast_fn(value), variant_type)
     except (ValueError, TypeError) as exc:
-        log.warning("Type cast failed (%s → %s): %s – falling back to String",
+        log.warning("Type cast failed (%s → %s): %s – writing BadDataEncodingInvalid",
                     value, opcua_type, exc)
-        return ua.Variant(str(value), ua.VariantType.String)
+        return ua.DataValue(
+            ua.Variant(None, ua.VariantType.Null),
+            ua.StatusCode(ua.StatusCodes.BadDataEncodingInvalid),
+        )
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -224,12 +230,18 @@ class SNMPPoller:
 
     # ── OID resolution cache ──────────────────────────────────────────────────
     # Maps opcua_name -> exact OID key string as returned by pysnmp.
-    # Populated on the first successful poll after each offline period.
-    # Cleared whenever the device goes offline so it re-resolves on recovery.
+    # Populated on the first successful poll; cleared when the device goes
+    # offline so keys are re-resolved on recovery.
     _oid_key_cache: Dict[str, str] = field(default_factory=dict, init=False, repr=False)
     _was_offline: bool = field(default=True, init=False, repr=False)
 
     # ─────────────────────────────────────────────────────────────────────────
+
+    def __post_init__(self) -> None:
+        # Create the SnmpEngine once and reuse it across all polls.
+        # Recreating it on every call is heavyweight (dispatcher threads, etc.)
+        # and leaks resources even when close_dispatcher() is called.
+        self._snmp_engine = SnmpEngine()
 
     @classmethod
     def from_dict(cls, cfg: dict) -> "SNMPPoller":
@@ -261,19 +273,18 @@ class SNMPPoller:
         object_types = [
             ObjectType(ObjectIdentity(oid_cfg.oid)) for oid_cfg in self.oids
         ]
-        snmp_engine = SnmpEngine()
-        try:
-            error_indication, error_status, error_index, var_binds = await get_cmd(
-                snmp_engine,
-                CommunityData(self.community, mpModel=1),   # mpModel=1 → SNMPv2c
-                await UdpTransportTarget.create(
-                    (self.ip, self.port), timeout=2, retries=1
-                ),
-                ContextData(),
-                *object_types,
-            )
-        finally:
-            snmp_engine.close_dispatcher()
+        # Re-use the engine that was created once in __post_init__.
+        # Do NOT call close_dispatcher() here — that would tear down the shared
+        # engine and break all subsequent polls on this poller.
+        error_indication, error_status, error_index, var_binds = await get_cmd(
+            self._snmp_engine,
+            CommunityData(self.community, mpModel=1),   # mpModel=1 → SNMPv2c
+            await UdpTransportTarget.create(
+                (self.ip, self.port), timeout=2, retries=1
+            ),
+            ContextData(),
+            *object_types,
+        )
 
         # Transport / auth failure — device completely unreachable
         if error_indication:
@@ -290,6 +301,10 @@ class SNMPPoller:
                 "SNMP GET %s: agent error '%s' at OID %s – skipping that OID",
                 self.ip, error_status.prettyPrint(), bad_oid,
             )
+            # SNMPv2c GET responses carry at most one error_index (RFC 3416
+            # §4.2.1), so removing the single offending var-bind is sufficient.
+            # The positions of the remaining var-binds still correspond 1-to-1
+            # with the original request order after the pop.
             # Remove the offending var-bind so we can still use the rest
             if bad_idx is not None:
                 var_binds = list(var_binds)
@@ -352,7 +367,10 @@ class SNMPPoller:
         if suffixed in results:
             return suffixed
         for key in results:
-            if key.endswith(oid_cfg.oid) or oid_cfg.oid.endswith(key):
+            # Guard with a dot boundary so that e.g. "1.1.0" does not
+            # accidentally match a key ending in "11.0" (plain string-suffix
+            # would pass but the OIDs are unrelated).
+            if key.endswith("." + oid_cfg.oid) or oid_cfg.oid.endswith("." + key):
                 return key
         return None
 
@@ -360,11 +378,14 @@ class SNMPPoller:
         """
         Fetch all configured OIDs in one bulk GET and write results to OPC UA.
 
-        OID key resolution (matching configured dotted-decimal strings to the
-        exact keys pysnmp returns) is performed only on the first successful
-        poll after the device was offline, then cached.  While the device stays
-        online the cached keys are used directly.  If the device goes offline
-        the cache is cleared so it will re-resolve on the next recovery.
+        OID key resolution is performed on the first successful poll after the
+        device was offline, then cached for subsequent cycles.  The cache is
+        cleared when the device goes offline so keys are re-resolved on
+        recovery.
+
+        On the offline transition every node whose OID key was successfully
+        resolved is stamped with UncertainLastUsableValue, preserving the last
+        known value while signalling to clients that it is stale.
 
         Returns True if the device responded (even partially), False if totally
         unreachable.
@@ -374,8 +395,26 @@ class SNMPPoller:
         if results is None:
             # Complete transport failure — device offline
             if not self._was_offline:
-                # Transition online → offline
+                # Transition online → offline: stamp resolved nodes as stale.
+                # UncertainLastUsableValue is not a bad status code, so asyncua
+                # still enforces the type check on the Value field — we must
+                # supply the correct typed variant.  We read the current DataValue
+                # from each node and reuse its Value, replacing only the status.
                 log.warning("Device went offline: %s", self.ip)
+                _uncertain = ua.StatusCode(ua.StatusCodes.UncertainLastUsableValue)
+                for opcua_name, _key in self._oid_key_cache.items():
+                    node = self._node_map.get(opcua_name)
+                    if node is not None:
+                        try:
+                            current_dv = await node.read_data_value()
+                            stale_dv = ua.DataValue(
+                                Value=current_dv.Value,
+                                StatusCode_=_uncertain,
+                            )
+                            await node.write_value(stale_dv)
+                        except Exception as exc:
+                            log.error("Failed to write UncertainLastUsableValue for %s.%s: %s",
+                                      self.opcua_path, opcua_name, exc)
                 self._oid_key_cache.clear()
                 self._was_offline = True
             else:
@@ -384,10 +423,7 @@ class SNMPPoller:
 
         # ── Device is responding ──────────────────────────────────────────────
         if self._was_offline:
-            # Transition offline → online: resolve and cache OID keys.
-            # OIDs that the device does not support are stored with the
-            # sentinel value _UNSUPPORTED so we can write null to their nodes
-            # each cycle rather than silently ignoring them.
+            # Transition offline → online: resolve and cache OID keys
             log.info("Device came online: %s — resolving OID keys", self.ip)
             self._oid_key_cache.clear()
             for oid_cfg in self.oids:
@@ -397,44 +433,35 @@ class SNMPPoller:
                     log.debug("  OID resolved: %s -> %s (%s)",
                               oid_cfg.oid, key, oid_cfg.opcua_name)
                 else:
-                    # Mark as newly-unsupported so the write loop writes null once
-                    self._oid_key_cache[oid_cfg.opcua_name] = _UNSUPPORTED_NEW
-                    log.warning("OID not supported by device – publishing null: "
+                    log.warning("OID not supported by device – marking BadNotSupported: "
                                 "%s on %s", oid_cfg.oid, self.ip)
+                    node = self._node_map.get(oid_cfg.opcua_name)
+                    if node is not None:
+                        try:
+                            current_dv = await node.read_data_value()
+                            await node.write_value(ua.DataValue(
+                                Value=current_dv.Value,
+                                StatusCode_=ua.StatusCode(ua.StatusCodes.BadNotSupported),
+                            ))
+                        except Exception as exc:
+                            log.error("Failed to write BadNotSupported for %s.%s: %s",
+                                      self.opcua_path, oid_cfg.opcua_name, exc)
             self._was_offline = False
 
-        # ── Write cached OID values to OPC UA ────────────────────────────────
-        _BAD_DV = ua.DataValue(
-            ua.Variant(None, ua.VariantType.Null),
-            ua.StatusCode(ua.StatusCodes.BadNotSupported),
-        )
+        # ── Write values to OPC UA ────────────────────────────────────────────
         any_ok = False
         for oid_cfg in self.oids:
             key = self._oid_key_cache.get(oid_cfg.opcua_name)
             node = self._node_map.get(oid_cfg.opcua_name)
-            if node is None:
-                continue
-
-            if key == _UNSUPPORTED_NEW:
-                # Newly discovered unsupported OID — write null exactly once,
-                # then demote to _UNSUPPORTED so subsequent cycles skip it
-                await node.write_value(_BAD_DV)
-                self._oid_key_cache[oid_cfg.opcua_name] = _UNSUPPORTED
-                continue
-
-            if key is None or key == _UNSUPPORTED:
-                # Already written null previously — nothing to do
+            if node is None or key is None:
                 continue
 
             raw = results.get(key)
             if raw is None:
-                # OID was valid at resolution time but absent now — write null
-                # once and demote so subsequent cycles skip it until re-resolution
-                log.warning("Cached OID key no longer in response: %s on %s "
-                            "(will re-resolve on next offline/online cycle)",
+                # Key resolved correctly at startup but absent in this response;
+                # log and leave the node at its current status until next cycle.
+                log.warning("Cached OID key no longer in response: %s on %s",
                             key, self.ip)
-                await node.write_value(_BAD_DV)
-                self._oid_key_cache[oid_cfg.opcua_name] = _UNSUPPORTED
                 continue
 
             any_ok = True
@@ -466,6 +493,11 @@ class _SingleUserManager:
         self._password = password
 
     def get_user(self, iserver, username=None, password=None, certificate=None):
+        # NOTE: The password is stored and compared as plain text.
+        # For a hardened deployment consider storing a hash instead
+        # (e.g. hashlib.pbkdf2_hmac) and comparing against that, particularly
+        # because the password arrives via the CLI and may appear in process
+        # listings or shell history.
         if username == self._username and password == self._password:
             # Return UserRole.User when available, otherwise any truthy value
             if UserRole is not None:
@@ -542,26 +574,14 @@ class OPCUAServer:
 
     async def _build_address_space(self, server: Server, ns_idx: int) -> None:
         """Create all OPC UA nodes for every registered poller."""
-        # Ensure the fixed SNMPDevices root object exists
-        snmp_devices_node = await self._ensure_path(server, ns_idx, ["SNMPDevices"])
-
         for poller in self._pollers:
-            # opcua_path is relative to SNMPDevices/
+            # opcua_path is relative to SNMPDevices/; _ensure_path handles both
+            # the root node and all sub-segments in one shot, eliminating the
+            # duplicated child-walk logic that used to live here.
             parts = poller.opcua_path.split(".")
-            # Build the device node under SNMPDevices
-            device_node = snmp_devices_node
-            for part in parts:
-                found = None
-                try:
-                    for child in await device_node.get_children():
-                        if await child.read_browse_name() == ua.QualifiedName(part, ns_idx):
-                            found = child
-                            break
-                except Exception:
-                    pass
-                if found is None:
-                    found = await device_node.add_object(ns_idx, part)
-                device_node = found
+            device_node = await self._ensure_path(
+                server, ns_idx, ["SNMPDevices"] + parts
+            )
 
             # ── device description on the object node ─────────────────────────
             if poller.description:
@@ -595,18 +615,24 @@ class OPCUAServer:
             # ── configured OIDs ───────────────────────────────────────────────
             poller._ns_idx = ns_idx
             for oid_cfg in poller.oids:
-                variant_type, cast_fn = _UA_TYPE_MAP[oid_cfg.opcua_type]
-                # initial zero/empty value of the correct type
+                variant_type, _cast_fn = _UA_TYPE_MAP[oid_cfg.opcua_type]
+                # Create the node with a typed zero so asyncua knows the
+                # correct VariantType, then immediately overwrite the status
+                # to BadWaitingForInitialData so clients see the node as
+                # uninitialised until the first successful poll arrives.
                 try:
-                    zero = cast_fn(0)
+                    zero = _cast_fn(0)
                 except (ValueError, TypeError):
-                    zero = cast_fn()   # e.g. str(), bytes()
+                    zero = _cast_fn()   # e.g. str(), bytes()
                 var_node = await device_node.add_variable(
                     ns_idx,
                     oid_cfg.opcua_name,
                     ua.Variant(zero, variant_type),
                 )
                 await var_node.set_writable(False)
+                await var_node.write_value(ua.DataValue(
+                    StatusCode_=ua.StatusCode(ua.StatusCodes.BadWaitingForInitialData),
+                ))
                 if oid_cfg.description:
                     await var_node.write_attribute(
                         ua.AttributeIds.Description,
@@ -770,8 +796,6 @@ def load_device_configs(paths: List[str]) -> List[dict]:
     All files are merged into a single flat list and returned.
     Exits with an error message if any file cannot be read or parsed.
     """
-    import json
-
     configs: List[dict] = []
     for path in paths:
         try:
