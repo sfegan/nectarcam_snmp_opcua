@@ -1,0 +1,34 @@
+{
+    "ip":            "127.0.0.1",
+    "port":          1161,
+    "community":     "public",
+    "description":   "Local test SNMP agent (net-snmp on localhost)",
+    "opcua_path":    "Localhost",
+    "poll_interval": 10,
+    "oids": [
+        {
+            "oid":         "1.3.6.1.2.1.1.1.0",
+            "opcua_name":  "sysDescr",
+            "opcua_type":  "String",
+            "description": "System description"
+        },
+        {
+            "oid":         "1.3.6.1.2.1.1.3.0",
+            "opcua_name":  "sysUpTime",
+            "opcua_type":  "UInt32",
+            "description": "System uptime (hundredths of a second)"
+        },
+        {
+            "oid":         "1.3.6.1.2.1.1.5.0",
+            "opcua_name":  "sysName",
+            "opcua_type":  "String",
+            "description": "Administratively assigned system name"
+        },
+        {
+            "oid":         "1.3.6.1.2.1.1.6.0",
+            "opcua_name":  "sysLocation",
+            "opcua_type":  "String",
+            "description": "Physical location of the system"
+        }
+    ]
+}
