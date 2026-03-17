@@ -79,6 +79,7 @@ try:
         TimeTicks,
         Unsigned32,
     )
+    from pysnmp.proto.rfc1905 import EndOfMibView, NoSuchInstance, NoSuchObject
 except ImportError:
     sys.exit("pysnmp is required:  pip install pysnmp-lextudio")
 
@@ -312,6 +313,14 @@ class SNMPPoller:
 
         results: Dict[str, Any] = {}
         for oid_obj, value in var_binds:
+            # pysnmp returns NoSuchObject / NoSuchInstance / EndOfMibView as
+            # value sentinels rather than raising an error.  Exclude them so
+            # that _resolve_oid_key correctly returns None for these OIDs and
+            # they get marked BadNotSupported on the OPC UA side.
+            if isinstance(value, (NoSuchObject, NoSuchInstance, EndOfMibView)):
+                log.debug("SNMP GET %s: OID %s returned %s – treating as unsupported",
+                          self.ip, oid_obj, type(value).__name__)
+                continue
             results[str(oid_obj)] = value
         return results
 
@@ -438,9 +447,10 @@ class SNMPPoller:
                     node = self._node_map.get(oid_cfg.opcua_name)
                     if node is not None:
                         try:
-                            current_dv = await node.read_data_value()
+                            # BadNotSupported is a bad status code so asyncua
+                            # bypasses the type check and forces Value to null
+                            # server-side — no need to read the current value first.
                             await node.write_value(ua.DataValue(
-                                Value=current_dv.Value,
                                 StatusCode_=ua.StatusCode(ua.StatusCodes.BadNotSupported),
                             ))
                         except Exception as exc:
