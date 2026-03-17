@@ -92,7 +92,7 @@ When `ip` is an array of strings, the bridge creates one SNMPPoller per address.
 
 This creates devices at `SNMPDevices/Switch00`, `SNMPDevices/Switch01`, `SNMPDevices/Switch02`, etc.
 
-If `opcua_path` doesn't contain `{instance}`, a suffix `_{index}` is automatically appended to avoid conflicts.
+If `opcua_path` doesn't contain `{instance}`, a suffix `_{instance}` is automatically appended to avoid conflicts.
 
 ### Example Configuration File
 

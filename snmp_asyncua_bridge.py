@@ -57,7 +57,7 @@ spec is valid:
     "description": "Distribution switch {instance}",
 
 If "ip" is an array and "opcua_path" does not contain {instance}, a
-warning is logged and "_{index}" is appended automatically as a fallback.
+warning is logged and "_{instance}" is appended automatically as a fallback.
 """
 
 from __future__ import annotations
@@ -835,7 +835,7 @@ def _expand_multi_ip(cfg: dict) -> List[dict]:
     "description" via str.format_map().
 
     If "opcua_path" does not contain {instance}, a warning is logged and
-    "_{index}" is appended automatically to avoid duplicate OPC UA paths.
+    "_{instance}" is appended automatically to avoid duplicate OPC UA paths.
 
     Returns a list with a single element when "ip" is a plain string.
     """
@@ -853,7 +853,7 @@ def _expand_multi_ip(cfg: dict) -> List[dict]:
     if "{instance" not in opcua_path_template:
         log.warning(
             'Multi-IP config "opcua_path" (%r) does not contain {instance} --'
-            ' appending "_{index}" automatically to avoid duplicate paths.',
+            ' appending "_{instance}" automatically to avoid duplicate paths.',
             opcua_path_template,
         )
         opcua_path_template = opcua_path_template + "_{instance}"
