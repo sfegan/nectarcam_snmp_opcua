@@ -217,6 +217,13 @@ class SNMPPoller:
     _state_node: Any = field(default=None, init=False, repr=False)
     _snmp_engine: Any = field(default=None, init=False, repr=False)
 
+    # ── OID resolution cache ──────────────────────────────────────────────────
+    # Maps opcua_name -> exact OID key string as returned by pysnmp.
+    # Populated on the first successful poll after each offline period.
+    # Cleared whenever the device goes offline so it re-resolves on recovery.
+    _oid_key_cache: Dict[str, str] = field(default_factory=dict, init=False, repr=False)
+    _was_offline: bool = field(default=True, init=False, repr=False)
+
     # ─────────────────────────────────────────────────────────────────────────
 
     @classmethod
@@ -235,32 +242,58 @@ class SNMPPoller:
 
     # ── SNMP helpers ──────────────────────────────────────────────────────────
 
-    async def _get_oid(self, oid: str) -> Optional[Any]:
-        """Perform a single SNMPv2c GET and return the raw value, or None."""
-        # pysnmp 7.x: get_cmd is an async generator; each iteration is one reply
+    async def _get_all_oids(self) -> Optional[Dict[str, Any]]:
+        """
+        Fetch all configured OIDs in a single bulk GET request.
+
+        Returns a dict mapping oid_str -> raw_value for every OID that
+        responded successfully, or None if the device was unreachable entirely
+        (error_indication set before any var-bind was returned).
+
+        Individual OIDs that the agent reports an error for are skipped and
+        logged as warnings; the remaining results are still returned.
+        """
+        object_types = [
+            ObjectType(ObjectIdentity(oid_cfg.oid)) for oid_cfg in self.oids
+        ]
         snmp_engine = SnmpEngine()
         try:
             error_indication, error_status, error_index, var_binds = await get_cmd(
                 snmp_engine,
-                CommunityData(self.community, mpModel=1),   # mpModel=1 → v2c
-                await UdpTransportTarget.create((self.ip, self.port), timeout=2, retries=1),
+                CommunityData(self.community, mpModel=1),   # mpModel=1 → SNMPv2c
+                await UdpTransportTarget.create(
+                    (self.ip, self.port), timeout=2, retries=1
+                ),
                 ContextData(),
-                ObjectType(ObjectIdentity(oid)),
+                *object_types,
             )
         finally:
             snmp_engine.close_dispatcher()
 
+        # Transport / auth failure — device completely unreachable
         if error_indication:
-            log.debug("SNMP GET %s %s: %s", self.ip, oid, error_indication)
-            return None
-        if error_status:
-            log.debug("SNMP GET %s %s: %s at %s",
-                      self.ip, oid, error_status.prettyPrint(),
-                      error_index and var_binds[int(error_index) - 1][0] or "?")
+            log.debug("SNMP bulk GET %s: %s", self.ip, error_indication)
             return None
 
-        _, value = var_binds[0]
-        return value
+        # Agent-level error — one or more var-binds bad, rest may be ok
+        if error_status:
+            bad_idx = int(error_index) - 1 if error_index else None
+            bad_oid = (
+                str(var_binds[bad_idx][0]) if bad_idx is not None else "unknown"
+            )
+            log.warning(
+                "SNMP GET %s: agent error '%s' at OID %s – skipping that OID",
+                self.ip, error_status.prettyPrint(), bad_oid,
+            )
+            # Remove the offending var-bind so we can still use the rest
+            if bad_idx is not None:
+                var_binds = list(var_binds)
+                var_binds.pop(bad_idx)
+
+        results: Dict[str, Any] = {}
+        for oid_obj, value in var_binds:
+            results[str(oid_obj)] = value
+        return results
 
     # ── polling loop ──────────────────────────────────────────────────────────
 
@@ -297,18 +330,83 @@ class SNMPPoller:
                 log.warning("Poller %s overran slot by %.3fs (cycle %d)",
                             self.ip, -sleep_for, cycle)
 
+    def _resolve_oid_key(self, oid_cfg: OIDConfig, results: Dict[str, Any]) -> Optional[str]:
+        """
+        Find the exact key string pysnmp used for this OID in a response dict.
+
+        pysnmp may reformat OID strings (e.g. resolving symbolic names or
+        normalising instance suffixes), so we try several strategies:
+          1. Exact match on the configured dotted-decimal string
+          2. Configured OID with ".0" appended (scalar instance suffix)
+          3. Any key that ends with the configured OID, or vice-versa
+        Returns the matching key, or None if the OID was not in the response.
+        """
+        if oid_cfg.oid in results:
+            return oid_cfg.oid
+        suffixed = oid_cfg.oid.rstrip(".0") + ".0"
+        if suffixed in results:
+            return suffixed
+        for key in results:
+            if key.endswith(oid_cfg.oid) or oid_cfg.oid.endswith(key):
+                return key
+        return None
+
     async def _poll_once(self) -> bool:
         """
-        Poll all configured OIDs.
-        Returns True if the device responded to at least one OID.
+        Fetch all configured OIDs in one bulk GET and write results to OPC UA.
+
+        OID key resolution (matching configured dotted-decimal strings to the
+        exact keys pysnmp returns) is performed only on the first successful
+        poll after the device was offline, then cached.  While the device stays
+        online the cached keys are used directly.  If the device goes offline
+        the cache is cleared so it will re-resolve on the next recovery.
+
+        Returns True if the device responded (even partially), False if totally
+        unreachable.
         """
+        results = await self._get_all_oids()
+
+        if results is None:
+            # Complete transport failure — device offline
+            if not self._was_offline:
+                # Transition online → offline
+                log.warning("Device went offline: %s", self.ip)
+                self._oid_key_cache.clear()
+                self._was_offline = True
+            else:
+                log.debug("Device still offline: %s", self.ip)
+            return False
+
+        # ── Device is responding ──────────────────────────────────────────────
+        if self._was_offline:
+            # Transition offline → online: resolve and cache OID keys
+            log.info("Device came online: %s — resolving OID keys", self.ip)
+            self._oid_key_cache.clear()
+            for oid_cfg in self.oids:
+                key = self._resolve_oid_key(oid_cfg, results)
+                if key is not None:
+                    self._oid_key_cache[oid_cfg.opcua_name] = key
+                    log.debug("  OID resolved: %s -> %s (%s)",
+                              oid_cfg.oid, key, oid_cfg.opcua_name)
+                else:
+                    log.warning("OID not in response – will skip: %s on %s",
+                                oid_cfg.oid, self.ip)
+            self._was_offline = False
+
+        # ── Write cached OID values to OPC UA ────────────────────────────────
         any_ok = False
         for oid_cfg in self.oids:
-            raw = await self._get_oid(oid_cfg.oid)
+            key = self._oid_key_cache.get(oid_cfg.opcua_name)
+            if key is None:
+                continue   # OID was unresolvable at last recovery — skip silently
+            raw = results.get(key)
             if raw is None:
-                log.warning("OID not resolved – skipping: %s on %s",
-                            oid_cfg.oid, self.ip)
+                # Key was valid at resolution time but missing now — stale cache
+                log.warning("Cached OID key no longer in response: %s on %s "
+                            "(will re-resolve on next offline/online cycle)",
+                            key, self.ip)
                 continue
+
             any_ok = True
             node = self._node_map.get(oid_cfg.opcua_name)
             if node is None:
@@ -321,8 +419,6 @@ class SNMPPoller:
                 log.error("OPC UA write failed for %s.%s: %s",
                           self.opcua_path, oid_cfg.opcua_name, exc)
 
-        if not any_ok:
-            log.warning("Device unreachable: %s", self.ip)
         return any_ok
 
 
