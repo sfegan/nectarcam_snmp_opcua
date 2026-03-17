@@ -43,6 +43,21 @@ Supported opcua_type values
 ---------------------------
   Boolean, SByte, Byte, Int16, UInt16, Int32, UInt32,
   Int64, UInt64, Float, Double, String, ByteString
+
+Multiple identical devices (ip array)
+--------------------------------------
+When "ip" is a JSON array of strings, one SNMPPoller is created per
+address.  The fields "opcua_path" and "description" may contain the
+placeholder {instance}, which is replaced with the zero-based index of
+the address in the array using Python str.format_map(), so any format
+spec is valid:
+
+    "ip":         ["192.168.1.10", "192.168.1.11", "192.168.1.12"],
+    "opcua_path": "Switch{instance:02d}",
+    "description": "Distribution switch {instance}",
+
+If "ip" is an array and "opcua_path" does not contain {instance}, a
+warning is logged and "_{index}" is appended automatically as a fallback.
 """
 
 from __future__ import annotations
@@ -243,6 +258,19 @@ class SNMPPoller:
         # Recreating it on every call is heavyweight (dispatcher threads, etc.)
         # and leaks resources even when close_dispatcher() is called.
         self._snmp_engine = SnmpEngine()
+
+        # Detect duplicate opcua_name values within this poller's OID list.
+        # Duplicates would silently overwrite each other's OPC UA node.
+        seen: set[str] = set()
+        dupes = [
+            o.opcua_name for o in self.oids
+            if o.opcua_name in seen or seen.add(o.opcua_name)  # type: ignore[func-returns-value]
+        ]
+        if dupes:
+            raise ValueError(
+                f"Duplicate opcua_name(s) in poller {self.opcua_path!r}: "
+                f"{sorted(set(dupes))}"
+            )
 
     @classmethod
     def from_dict(cls, cfg: dict) -> "SNMPPoller":
@@ -551,6 +579,14 @@ class OPCUAServer:
 
     def register(self, poller: SNMPPoller) -> None:
         """Register an SNMPPoller with this server."""
+        clash = next(
+            (p for p in self._pollers if p.opcua_path == poller.opcua_path), None
+        )
+        if clash is not None:
+            raise ValueError(
+                f"Duplicate opcua_path {poller.opcua_path!r}: "
+                f"already registered for {clash.ip}, cannot add {poller.ip}"
+            )
         self._pollers.append(poller)
         log.info("Registered poller: %s → %s", poller.ip, poller.opcua_path)
 
@@ -795,6 +831,57 @@ EXAMPLE_CONFIGS = [
 ]
 
 
+def _expand_multi_ip(cfg: dict) -> List[dict]:
+    """
+    If cfg["ip"] is a list, expand it into one config dict per address,
+    substituting {instance} (zero-based index) into "opcua_path" and
+    "description" via str.format_map().
+
+    If "opcua_path" does not contain {instance}, a warning is logged and
+    "_{index}" is appended automatically to avoid duplicate OPC UA paths.
+
+    Returns a list with a single element when "ip" is a plain string.
+    """
+    ip = cfg["ip"]
+    if isinstance(ip, str):
+        return [cfg]
+
+    if not isinstance(ip, list) or not all(isinstance(a, str) for a in ip):
+        sys.exit(
+            f'Config "ip" must be a string or a list of strings, '
+            f'got: {ip!r}'
+        )
+
+    opcua_path_template = cfg.get("opcua_path", "")
+    if "{instance" not in opcua_path_template:
+        log.warning(
+            'Multi-IP config "opcua_path" (%r) does not contain {instance} --'
+            ' appending "_{index}" automatically to avoid duplicate paths.',
+            opcua_path_template,
+        )
+        opcua_path_template = opcua_path_template + "_{instance}"
+
+    expanded: List[dict] = []
+    for idx, address in enumerate(ip):
+        fmt = {"instance": idx}
+        instance_cfg = dict(cfg)
+        instance_cfg["ip"] = address
+        try:
+            instance_cfg["opcua_path"] = opcua_path_template.format_map(fmt)
+        except (KeyError, ValueError) as exc:
+            sys.exit(f'Bad opcua_path template {opcua_path_template!r}: {exc}')
+        desc = cfg.get("description", "")
+        if desc:
+            try:
+                instance_cfg["description"] = desc.format_map(fmt)
+            except (KeyError, ValueError) as exc:
+                sys.exit(f'Bad description template {desc!r}: {exc}')
+        expanded.append(instance_cfg)
+        log.debug("Expanded multi-IP config: ip=%s opcua_path=%s",
+                  address, instance_cfg["opcua_path"])
+    return expanded
+
+
 def load_device_configs(paths: List[str]) -> List[dict]:
     """
     Load device configuration(s) from one or more JSON files.
@@ -802,6 +889,9 @@ def load_device_configs(paths: List[str]) -> List[dict]:
     Each file may contain either:
       • a JSON object  → treated as a single device configuration
       • a JSON array   → treated as a list of device configurations
+
+    When a config's "ip" field is a JSON array of strings, it is
+    automatically expanded into one config per address (see _expand_multi_ip).
 
     All files are merged into a single flat list and returned.
     Exits with an error message if any file cannot be read or parsed.
@@ -817,20 +907,23 @@ def load_device_configs(paths: List[str]) -> List[dict]:
             sys.exit(f"Device config file is not valid JSON ({path}): {exc}")
 
         if isinstance(data, dict):
-            configs.append(data)
+            raw_list = [data]
             log.debug("Loaded 1 device config from %s", path)
         elif isinstance(data, list):
             if not all(isinstance(item, dict) for item in data):
                 sys.exit(
                     f"Device config array in {path} must contain only objects"
                 )
-            configs.extend(data)
+            raw_list = data
             log.debug("Loaded %d device config(s) from %s", len(data), path)
         else:
             sys.exit(
                 f"Device config file {path} must be a JSON object or array, "
                 f"got {type(data).__name__}"
             )
+
+        for raw_cfg in raw_list:
+            configs.extend(_expand_multi_ip(raw_cfg))
 
     return configs
 
