@@ -140,6 +140,11 @@ _UA_TYPE_MAP: Dict[str, tuple[ua.VariantType, Any]] = {
 }
 
 
+# Sentinel stored in _oid_key_cache for OIDs the device does not support
+_UNSUPPORTED     = "_UNSUPPORTED_"      # bad OID, null already written — skip each cycle
+_UNSUPPORTED_NEW = "_UNSUPPORTED_NEW_"  # just discovered bad — write null once then demote to _UNSUPPORTED
+
+
 def _snmp_value_to_python(raw_value: Any) -> Any:
     """Convert a pysnmp value object to a plain Python value."""
     if isinstance(raw_value, (Integer, Integer32, TimeTicks,
@@ -379,7 +384,10 @@ class SNMPPoller:
 
         # ── Device is responding ──────────────────────────────────────────────
         if self._was_offline:
-            # Transition offline → online: resolve and cache OID keys
+            # Transition offline → online: resolve and cache OID keys.
+            # OIDs that the device does not support are stored with the
+            # sentinel value _UNSUPPORTED so we can write null to their nodes
+            # each cycle rather than silently ignoring them.
             log.info("Device came online: %s — resolving OID keys", self.ip)
             self._oid_key_cache.clear()
             for oid_cfg in self.oids:
@@ -389,28 +397,47 @@ class SNMPPoller:
                     log.debug("  OID resolved: %s -> %s (%s)",
                               oid_cfg.oid, key, oid_cfg.opcua_name)
                 else:
-                    log.warning("OID not in response – will skip: %s on %s",
-                                oid_cfg.oid, self.ip)
+                    # Mark as newly-unsupported so the write loop writes null once
+                    self._oid_key_cache[oid_cfg.opcua_name] = _UNSUPPORTED_NEW
+                    log.warning("OID not supported by device – publishing null: "
+                                "%s on %s", oid_cfg.oid, self.ip)
             self._was_offline = False
 
         # ── Write cached OID values to OPC UA ────────────────────────────────
+        _BAD_DV = ua.DataValue(
+            ua.Variant(None, ua.VariantType.Null),
+            ua.StatusCode(ua.StatusCodes.BadNotSupported),
+        )
         any_ok = False
         for oid_cfg in self.oids:
             key = self._oid_key_cache.get(oid_cfg.opcua_name)
-            if key is None:
-                continue   # OID was unresolvable at last recovery — skip silently
-            raw = results.get(key)
-            if raw is None:
-                # Key was valid at resolution time but missing now — stale cache
-                log.warning("Cached OID key no longer in response: %s on %s "
-                            "(will re-resolve on next offline/online cycle)",
-                            key, self.ip)
-                continue
-
-            any_ok = True
             node = self._node_map.get(oid_cfg.opcua_name)
             if node is None:
                 continue
+
+            if key == _UNSUPPORTED_NEW:
+                # Newly discovered unsupported OID — write null exactly once,
+                # then demote to _UNSUPPORTED so subsequent cycles skip it
+                await node.write_value(_BAD_DV)
+                self._oid_key_cache[oid_cfg.opcua_name] = _UNSUPPORTED
+                continue
+
+            if key is None or key == _UNSUPPORTED:
+                # Already written null previously — nothing to do
+                continue
+
+            raw = results.get(key)
+            if raw is None:
+                # OID was valid at resolution time but absent now — write null
+                # once and demote so subsequent cycles skip it until re-resolution
+                log.warning("Cached OID key no longer in response: %s on %s "
+                            "(will re-resolve on next offline/online cycle)",
+                            key, self.ip)
+                await node.write_value(_BAD_DV)
+                self._oid_key_cache[oid_cfg.opcua_name] = _UNSUPPORTED
+                continue
+
+            any_ok = True
             py_val = _snmp_value_to_python(raw)
             variant = _cast_to_ua(py_val, oid_cfg.opcua_type)
             try:
@@ -673,6 +700,20 @@ def parse_args() -> argparse.Namespace:
         choices=["DEBUG", "INFO", "WARNING", "ERROR", "CRITICAL"],
     )
     p.add_argument("--log-file", default=None, help="Optional log file path")
+    p.add_argument(
+        "--device-config",
+        metavar="FILE.json",
+        action="append",
+        dest="device_configs",
+        default=[],
+        help=(
+            "Path to a JSON file describing one or more device configurations. "
+            "The top-level element may be a single object (one device) or an "
+            "array (multiple devices). May be specified more than once to load "
+            "several files. When any --device-config is given, EXAMPLE_CONFIGS "
+            "is ignored."
+        ),
+    )
     return p.parse_args()
 
 
@@ -718,6 +759,48 @@ EXAMPLE_CONFIGS = [
 ]
 
 
+def load_device_configs(paths: List[str]) -> List[dict]:
+    """
+    Load device configuration(s) from one or more JSON files.
+
+    Each file may contain either:
+      • a JSON object  → treated as a single device configuration
+      • a JSON array   → treated as a list of device configurations
+
+    All files are merged into a single flat list and returned.
+    Exits with an error message if any file cannot be read or parsed.
+    """
+    import json
+
+    configs: List[dict] = []
+    for path in paths:
+        try:
+            with open(path) as fh:
+                data = json.load(fh)
+        except FileNotFoundError:
+            sys.exit(f"Device config file not found: {path}")
+        except json.JSONDecodeError as exc:
+            sys.exit(f"Device config file is not valid JSON ({path}): {exc}")
+
+        if isinstance(data, dict):
+            configs.append(data)
+            log.debug("Loaded 1 device config from %s", path)
+        elif isinstance(data, list):
+            if not all(isinstance(item, dict) for item in data):
+                sys.exit(
+                    f"Device config array in {path} must contain only objects"
+                )
+            configs.extend(data)
+            log.debug("Loaded %d device config(s) from %s", len(data), path)
+        else:
+            sys.exit(
+                f"Device config file {path} must be a JSON object or array, "
+                f"got {type(data).__name__}"
+            )
+
+    return configs
+
+
 async def async_main() -> None:
     args = parse_args()
     setup_logging(args.log_level, args.log_file)
@@ -736,7 +819,14 @@ async def async_main() -> None:
         password=password,
     )
 
-    for cfg in EXAMPLE_CONFIGS:
+    if args.device_configs:
+        configs = load_device_configs(args.device_configs)
+        log.info("Using %d device config(s) from command-line JSON file(s)", len(configs))
+    else:
+        configs = EXAMPLE_CONFIGS
+        log.info("No --device-config given — using built-in EXAMPLE_CONFIGS")
+
+    for cfg in configs:
         opcua_server.register(SNMPPoller.from_dict(cfg))
 
     await opcua_server.run()
