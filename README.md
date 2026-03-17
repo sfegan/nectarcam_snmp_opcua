@@ -62,7 +62,7 @@ Each device configuration is a JSON object with the following fields:
 
 - `ip` (string or array of strings): IP address(es) of the SNMP device(s). If an array, multiple identical devices are created with `{instance}` placeholder substitution.
 - `port` (integer, optional): SNMP port (default: 161)
-- `community` (string): SNMP community string
+- `community` (string, optional): SNMP community string (default: "public")
 - `description` (string, optional): Human-readable description of the device
 - `opcua_path` (string): OPC UA path relative to `SNMPDevices/`, e.g., `"Switch01"`. For multi-IP configurations, use `{instance}` for substitution.
 - `poll_interval` (number, optional): Polling interval in seconds (default: 10)
@@ -86,8 +86,6 @@ When `ip` is an array of strings, the bridge creates one SNMPPoller per address.
   "ip": ["192.168.1.10", "192.168.1.11", "192.168.1.12"],
   "opcua_path": "Switch{instance:02d}",
   "description": "Distribution switch {instance}",
-  "community": "public",
-  "poll_interval": 10,
   "oids": [...]
 }
 ```
@@ -101,11 +99,8 @@ If `opcua_path` doesn't contain `{instance}`, a suffix `_{index}` is automatical
 ```json
 {
   "ip": "192.168.1.10",
-  "port": 161,
-  "community": "public",
   "description": "Main distribution switch, rack A",
   "opcua_path": "Switch01",
-  "poll_interval": 10,
   "oids": [
     {
       "oid": "1.3.6.1.2.1.1.1.0",
@@ -132,13 +127,11 @@ You can define multiple devices in a single JSON file as an array:
   {
     "ip": "192.168.1.10",
     "opcua_path": "Switch01",
-    "community": "public",
     "oids": [...]
   },
   {
     "ip": "192.168.1.11",
     "opcua_path": "Switch02",
-    "community": "public",
     "oids": [...]
   }
 ]
