@@ -25,13 +25,13 @@ Each SNMPPoller is built from a dict like:
         "poll_interval": 10,            # optional, defaults to 10 (seconds)
         "oids": [
             {
-                "oid":         "1.3.6.1.2.1.1.1.0",   # sysDescr
+                "oid":         "1.3.6.1.2.1.1.1.0",   # sysDescr  (dotted-decimal)
                 "opcua_name":  "sysDescr",
                 "opcua_type":  "String",
                 "description": "System description",   # optional, defaults to ""
             },
             {
-                "oid":         "1.3.6.1.2.1.1.3.0",   # sysUpTime
+                "oid":         "SNMPv2-MIB::sysUpTime.0",   # symbolic name also accepted
                 "opcua_name":  "sysUpTime",
                 "opcua_type":  "UInt32",
                 "description": "System uptime in hundredths of a second",
@@ -67,6 +67,7 @@ import asyncio
 import json
 import logging
 import logging.handlers
+import re
 import sys
 from dataclasses import dataclass, field
 from typing import Any, Dict, List, Optional
@@ -196,12 +197,103 @@ def _cast_to_ua(value: Any, opcua_type: str) -> ua.DataValue | ua.Variant:
 
 
 # ─────────────────────────────────────────────────────────────────────────────
+# Symbolic OID resolution  (e.g. "SNMPv2-MIB::sysName.0" → "1.3.6.1.2.1.1.5.0")
+# ─────────────────────────────────────────────────────────────────────────────
+
+_DOTTED_RE = re.compile(r'^[\d.]+$')
+
+
+def _is_dotted(oid: str) -> bool:
+    """Return True if *oid* is already in dotted-decimal notation."""
+    return bool(_DOTTED_RE.match(oid))
+
+
+def _resolve_via_snmptranslate(oid: str) -> Optional[str]:
+    """
+    Use the ``snmptranslate`` command (net-snmp) to convert a symbolic OID to
+    dotted-decimal.  Returns the numeric string, or None if the tool is
+    unavailable or the name is unknown.
+    """
+    import shutil
+    import subprocess
+    if shutil.which("snmptranslate") is None:
+        return None
+    try:
+        result = subprocess.run(
+            ["snmptranslate", "-On", oid],
+            capture_output=True, text=True, timeout=5,
+        )
+        if result.returncode == 0:
+            numeric = result.stdout.strip()
+            if _is_dotted(numeric.lstrip(".")):
+                return numeric.lstrip(".")
+    except (subprocess.TimeoutExpired, OSError):
+        pass
+    return None
+
+
+def _resolve_via_pysnmp(oid: str) -> Optional[str]:
+    """
+    Use pysnmp's built-in MIB compiler to resolve a symbolic OID.  Only works
+    for MIBs that pysnmp ships with (RFC MIBs, SNMPv2-MIB, IF-MIB, etc.).
+    Returns the dotted-decimal string, or None on failure.
+    """
+    try:
+        from pysnmp.smi import builder, view, compiler, rfc1902 as smi_rfc1902
+        mib_builder = builder.MibBuilder()
+        compiler.addMibCompiler(mib_builder)
+        mib_view = view.MibViewController(mib_builder)
+        obj = ObjectIdentity(oid)
+        obj.resolveWithMib(mib_view)
+        return str(obj.getOid())
+    except Exception:
+        return None
+
+
+def resolve_oid_name(oid: str) -> str:
+    """
+    Convert a symbolic OID name to dotted-decimal notation.
+
+    Accepts both ``MODULE::objectName.instance`` (MIB-qualified) and plain
+    ``objectName.instance`` forms.  Dotted-decimal OIDs are returned unchanged.
+
+    Resolution order:
+      1. Already dotted-decimal → return as-is.
+      2. ``snmptranslate`` (net-snmp, respects the system MIB path).
+      3. pysnmp's bundled MIB compiler (covers RFC/IANA MIBs without net-snmp).
+
+    Raises ``ValueError`` if neither resolver can translate the name.
+    """
+    if _is_dotted(oid):
+        return oid
+
+    numeric = _resolve_via_snmptranslate(oid)
+    if numeric is not None:
+        log.debug("Resolved OID %r → %s (via snmptranslate)", oid, numeric)
+        return numeric
+
+    numeric = _resolve_via_pysnmp(oid)
+    if numeric is not None:
+        log.debug("Resolved OID %r → %s (via pysnmp MIB compiler)", oid, numeric)
+        return numeric
+
+    raise ValueError(
+        f"Cannot resolve symbolic OID {oid!r}: "
+        "snmptranslate was not found or returned an error, and pysnmp's "
+        "bundled MIBs do not contain this name. "
+        "Install net-snmp (for snmptranslate) or add the required MIB files."
+    )
+
+
+# ─────────────────────────────────────────────────────────────────────────────
 # OID configuration dataclass
 # ─────────────────────────────────────────────────────────────────────────────
 
 @dataclass
 class OIDConfig:
-    oid: str                  # dotted-decimal  e.g. "1.3.6.1.2.1.1.1.0"
+    oid: str                  # dotted-decimal or symbolic, e.g. "SNMPv2-MIB::sysName.0"
+                              # Symbolic names are resolved to dotted-decimal in __post_init__
+                              # so the poll loop and OID-key resolver always see numeric OIDs.
     opcua_name: str           # variable name on OPC UA side
     opcua_type: str           # one of the keys in _UA_TYPE_MAP
     description: str = ""
@@ -212,6 +304,9 @@ class OIDConfig:
                 f"Unknown opcua_type '{self.opcua_type}' for OID {self.oid}. "
                 f"Valid types: {list(_UA_TYPE_MAP)}"
             )
+        # Resolve symbolic names (e.g. "SNMPv2-MIB::sysName.0") to dotted-decimal
+        # once at load time so the poll loop never has to deal with them.
+        self.oid = resolve_oid_name(self.oid)
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -299,6 +394,9 @@ class SNMPPoller:
         object_types = [
             ObjectType(ObjectIdentity(oid_cfg.oid)) for oid_cfg in self.oids
         ]
+        log.debug("SNMP GET %s:%d — requesting %d OID(s): %s",
+                  self.ip, self.port, len(self.oids),
+                  ", ".join(o.oid for o in self.oids))
         # Re-use the engine that was created once in __post_init__.
         # Do NOT call close_dispatcher() here — that would tear down the shared
         # engine and break all subsequent polls on this poller.
@@ -347,6 +445,14 @@ class SNMPPoller:
                           self.ip, oid_obj, type(value).__name__)
                 continue
             results[str(oid_obj)] = value
+
+        if log.isEnabledFor(logging.DEBUG):
+            log.debug("SNMP GET %s:%d — %d var-bind(s) received:",
+                      self.ip, self.port, len(results))
+            for oid_key, raw_val in results.items():
+                log.debug("  %s = %s (%s)",
+                          oid_key, raw_val.prettyPrint(), type(raw_val).__name__)
+
         return results
 
     # ── polling loop ──────────────────────────────────────────────────────────
@@ -370,6 +476,7 @@ class SNMPPoller:
         cycle = 0
 
         while True:
+            log.debug("Poller %s: starting cycle %d", self.ip, cycle + 1)
             online = await self._poll_once()
             state_val = ua.Variant(1 if online else 0, ua.VariantType.Byte)
             await self._state_node.write_value(state_val)
@@ -378,6 +485,8 @@ class SNMPPoller:
             next_deadline = origin + cycle * self.poll_interval
             sleep_for = next_deadline - loop.time()
             if sleep_for > 0:
+                log.debug("Poller %s: cycle %d done, sleeping %.3fs",
+                          self.ip, cycle, sleep_for)
                 await asyncio.sleep(sleep_for)
             else:
                 # Poll overran its slot — log and continue immediately
@@ -396,16 +505,21 @@ class SNMPPoller:
         Returns the matching key, or None if the OID was not in the response.
         """
         if oid_cfg.oid in results:
+            log.debug("  OID key match (exact): %s", oid_cfg.oid)
             return oid_cfg.oid
         suffixed = oid_cfg.oid.rstrip(".0") + ".0"
         if suffixed in results:
+            log.debug("  OID key match (suffixed .0): %s → %s", oid_cfg.oid, suffixed)
             return suffixed
         for key in results:
             # Guard with a dot boundary so that e.g. "1.1.0" does not
             # accidentally match a key ending in "11.0" (plain string-suffix
             # would pass but the OIDs are unrelated).
             if key.endswith("." + oid_cfg.oid) or oid_cfg.oid.endswith("." + key):
+                log.debug("  OID key match (suffix boundary): %s → %s", oid_cfg.oid, key)
                 return key
+        log.debug("  OID key not found in response: %s  (available keys: %s)",
+                  oid_cfg.oid, list(results))
         return None
 
     async def _poll_once(self) -> bool:
@@ -502,6 +616,9 @@ class SNMPPoller:
             any_ok = True
             py_val = _snmp_value_to_python(raw)
             variant = _cast_to_ua(py_val, oid_cfg.opcua_type)
+            log.debug("  Writing %s.%s = %r (raw type: %s)",
+                      self.opcua_path, oid_cfg.opcua_name,
+                      py_val, type(raw).__name__)
             try:
                 await node.write_value(variant)
             except Exception as exc:
@@ -534,10 +651,12 @@ class _SingleUserManager:
         # because the password arrives via the CLI and may appear in process
         # listings or shell history.
         if username == self._username and password == self._password:
+            log.debug("OPC UA client authenticated: user=%r", username)
             # Return UserRole.User when available, otherwise any truthy value
             if UserRole is not None:
                 return UserRole.User
             return True      # asyncua 1.1.x: truthy value grants access
+        log.debug("OPC UA client authentication failed: user=%r", username)
         return None          # None/falsy -> deny
 
 
@@ -612,6 +731,8 @@ class OPCUAServer:
             if found is None:
                 found = await parent.add_object(ns_idx, part)
                 log.debug("Created OPC UA object node: %s", part)
+            else:
+                log.debug("Reused existing OPC UA object node: %s", part)
             parent = found
         return parent
 
@@ -687,8 +808,9 @@ class OPCUAServer:
                         ),
                     )
                 poller._node_map[oid_cfg.opcua_name] = var_node
-                log.debug("  OPC UA variable: %s.%s (%s)",
-                          poller.opcua_path, oid_cfg.opcua_name, oid_cfg.opcua_type)
+                log.debug("  OPC UA variable: %s.%s (%s)  node_id=%s",
+                          poller.opcua_path, oid_cfg.opcua_name,
+                          oid_cfg.opcua_type, var_node.nodeid)
 
             log.info("Address space built for %s", poller.opcua_path)
 
@@ -729,6 +851,8 @@ class OPCUAServer:
                 asyncio.create_task(poller.run(), name=f"poller-{poller.ip}")
                 for poller in self._pollers
             ]
+            log.debug("Launched %d poller task(s): %s",
+                      len(tasks), ", ".join(t.get_name() for t in tasks))
             try:
                 await asyncio.gather(*tasks)
             except asyncio.CancelledError:
