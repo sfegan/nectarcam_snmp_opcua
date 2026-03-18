@@ -71,6 +71,7 @@ Each device configuration is a JSON object with the following fields:
 - `opcua_path` (string): Dot-separated OPC UA path relative to the root container (set by `--opcua-root`), e.g., `"Switch01"` or `"Switch.Monitoring"`. For multi-IP configurations, use `{instance}` for substitution.
 - `poll_interval` (number, optional): Polling interval in seconds (default: 10)
 - `oids` (array): List of OID configurations
+- `constants` (array, optional): List of constant variable configurations
 
 ### OID Configuration Structure
 
@@ -80,6 +81,19 @@ Each OID in the `oids` array is a JSON object with:
 - `opcua_name` (string): Name of the OPC UA variable
 - `opcua_type` (string): OPC UA data type. Supported types: `Boolean`, `SByte`, `Byte`, `Int16`, `UInt16`, `Int32`, `UInt32`, `Int64`, `UInt64`, `Float`, `Double`, `String`, `ByteString`
 - `description` (string, optional): Description of the OID (default: "")
+
+### Constants Configuration Structure
+
+Each constant in the `constants` array is a JSON object with:
+
+- `opcua_name` (string): Name of the OPC UA variable
+- `opcua_type` (string): OPC UA data type. Supported types: `Boolean`, `SByte`, `Byte`, `Int16`, `UInt16`, `Int32`, `UInt32`, `Int64`, `UInt64`, `Float`, `Double`, `String`, `ByteString`
+- `value` (any): The constant value to write (must be compatible with `opcua_type`)
+- `description` (string, optional): Description of the constant
+
+Constants are fixed OPC UA variables whose values are written once at startup and never updated. They are useful for static metadata such as firmware version, serial number, or device model.
+
+For multi-IP configurations, the `{instance}` placeholder can be used in `value` (if it is a string) and `description` fields for per-device customization.
 
 ## OPC UA Root Path
 
@@ -129,6 +143,14 @@ If `opcua_path` doesn't contain `{instance}`, a suffix `_{instance}` is automati
       "opcua_type": "UInt32",
       "description": "System uptime in hundredths of a second"
     }
+  ],
+  "constants": [
+    {
+      "opcua_name": "SoftwareVersion",
+      "opcua_type": "String",
+      "value": "2.0.0",
+      "description": "Firmware version of the device"
+    }
   ]
 }
 ```
@@ -161,7 +183,7 @@ The bridge creates the following structure in the OPC UA server:
     - `host` (String): Device IP address
     - `port` (UInt16): Device port
     - `cls_state` (Byte): Online state (1 = online, 0 = offline)
-    - `{opcua_name}`: Configured OID variables
+    - `{opcua_name}`: Configured OID and constant variables
 
 For example, with `--opcua-root SNMPDevices` and `opcua_path: "Switch.Monitoring"`, the device variables would be under `Objects/SNMPDevices/Switch/Monitoring/`.
 
