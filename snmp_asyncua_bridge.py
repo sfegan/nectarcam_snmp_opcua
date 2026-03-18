@@ -8,6 +8,7 @@ Usage
 python snmp_asyncua_bridge.py \
     --opcua-endpoint opc.tcp://0.0.0.0:4840/nectarcam/ \
     --opcua-namespace http://cta-observatory.org/nectarcam/snmpdevices/ \
+    --opcua-root SNMPDevices \
     --opcua-user admin:secret \
     --log-level INFO \
     --log-file bridge.log
@@ -21,7 +22,7 @@ Each SNMPPoller is built from a dict like:
         "port":        161,             # optional, defaults to 161
         "community":   "public",        # optional, defaults to "public"
         "description": "Main distribution switch, rack A",  # optional, defaults to ""
-        "opcua_path":  "Switch01",      # relative to SNMPDevices/
+        "opcua_path":  "Switch01",      # relative to --opcua-root (or Objects/ if root is empty)
         "poll_interval": 10,            # optional, defaults to 10 (seconds)
         "oids": [
             {
@@ -38,6 +39,18 @@ Each SNMPPoller is built from a dict like:
             },
         ],
     }
+
+OPC UA root path (--opcua-root)
+--------------------------------
+Controls the container node(s) created above every device object:
+
+  --opcua-root SNMPDevices        → Objects/SNMPDevices/Switch01  (default)
+  --opcua-root Camera0.SNMPDevices → Objects/Camera0/SNMPDevices/Switch01
+  --opcua-root ""                  → Objects/Switch01  (devices directly under Objects/)
+
+The value is split on "." so each segment becomes one Object node level.
+Passing an empty string (or omitting the flag and passing "") places devices
+directly under the server's Objects/ node with no intermediate container.
 
 Supported opcua_type values
 ---------------------------
@@ -699,6 +712,7 @@ class OPCUAServer:
     server = OPCUAServer(
         endpoint="opc.tcp://0.0.0.0:4840/nectarcam/",
         namespace="http://cta-observatory.org/nectarcam/snmpdevices/",
+        root_path="SNMPDevices",
         user="admin",
         password="secret",
     )
@@ -710,11 +724,16 @@ class OPCUAServer:
         self,
         endpoint: str,
         namespace: str,
+        root_path: str = "SNMPDevices",
         user: Optional[str] = None,
         password: Optional[str] = None,
     ):
         self.endpoint = endpoint
         self.namespace = namespace
+        # Split root_path on "." and discard any empty segments so that
+        # root_path="" (no container) and root_path="A..B" (typo) both
+        # behave sensibly.
+        self.root_parts: List[str] = [p for p in root_path.split(".") if p]
         self.user = user
         self.password = password
         self._pollers: List[SNMPPoller] = []
@@ -765,13 +784,16 @@ class OPCUAServer:
 
     async def _build_address_space(self, server: Server, ns_idx: int) -> None:
         """Create all OPC UA nodes for every registered poller."""
+        root_desc = ".".join(self.root_parts) if self.root_parts else "(Objects root)"
+        log.debug("Building address space under: %s", root_desc)
         for poller in self._pollers:
-            # opcua_path is relative to SNMPDevices/; _ensure_path handles both
-            # the root node and all sub-segments in one shot, eliminating the
-            # duplicated child-walk logic that used to live here.
-            parts = poller.opcua_path.split(".")
+            # Combine the root path segments with the poller's own path segments.
+            # Either or both may be empty: an empty root means devices land
+            # directly under Objects/; an empty opcua_path is unusual but valid
+            # and would place the device node inside the root container itself.
+            poller_parts = [p for p in poller.opcua_path.split(".") if p]
             device_node = await self._ensure_path(
-                server, ns_idx, ["SNMPDevices"] + parts
+                server, ns_idx, self.root_parts + poller_parts
             )
 
             # ── device description on the object node ─────────────────────────
@@ -920,6 +942,16 @@ def parse_args() -> argparse.Namespace:
         "--opcua-namespace",
         default="http://cta-observatory.org/nectarcam/snmpdevices/",
         help="OPC UA namespace URI",
+    )
+    p.add_argument(
+        "--opcua-root",
+        default="SNMPDevices",
+        metavar="PATH",
+        help=(
+            "Dot-separated OPC UA path of the container node created above all "
+            "device objects (e.g. 'SNMPDevices' or 'Camera0.SNMPDevices'). "
+            "Pass an empty string to place devices directly under Objects/."
+        ),
     )
     p.add_argument(
         "--opcua-user",
@@ -1103,9 +1135,12 @@ async def async_main() -> None:
     opcua_server = OPCUAServer(
         endpoint=args.opcua_endpoint,
         namespace=args.opcua_namespace,
+        root_path=args.opcua_root,
         user=user,
         password=password,
     )
+    root_display = args.opcua_root if args.opcua_root else "(none — devices under Objects/)"
+    log.info("OPC UA root path: %s", root_display)
 
     if args.device_configs:
         configs = load_device_configs(args.device_configs)
