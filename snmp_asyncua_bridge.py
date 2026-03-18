@@ -120,6 +120,9 @@ except ImportError:
 def setup_logging(level: str, log_file: Optional[str]) -> logging.Logger:
     logger = logging.getLogger("snmp_asyncua_bridge")
     logger.setLevel(getattr(logging, level.upper(), logging.INFO))
+    # Remove any handlers added by a previous call (e.g. in tests) so we never
+    # accumulate duplicate handlers and produce doubled log lines.
+    logger.handlers.clear()
     fmt = logging.Formatter(
         "%(asctime)s  %(levelname)-8s  %(name)s  %(message)s",
         datefmt="%Y-%m-%dT%H:%M:%S",
@@ -161,9 +164,7 @@ _UA_TYPE_MAP: Dict[str, tuple[ua.VariantType, Any]] = {
 def _snmp_value_to_python(raw_value: Any) -> Any:
     """Convert a pysnmp value object to a plain Python value."""
     if isinstance(raw_value, (Integer, Integer32, TimeTicks,
-                               Counter32, Gauge32, Unsigned32)):
-        return int(raw_value)
-    if isinstance(raw_value, Counter64):
+                               Counter32, Counter64, Gauge32, Unsigned32)):
         return int(raw_value)
     if isinstance(raw_value, IpAddress):
         return str(raw_value)
@@ -200,11 +201,11 @@ def _cast_to_ua(value: Any, opcua_type: str) -> ua.DataValue | ua.Variant:
 # Symbolic OID resolution  (e.g. "SNMPv2-MIB::sysName.0" → "1.3.6.1.2.1.1.5.0")
 # ─────────────────────────────────────────────────────────────────────────────
 
-_DOTTED_RE = re.compile(r'^[\d.]+$')
+_DOTTED_RE = re.compile(r'^\d+(\.\d+)+$')
 
 
 def _is_dotted(oid: str) -> bool:
-    """Return True if *oid* is already in dotted-decimal notation."""
+    """Return True if *oid* is already in valid dotted-decimal notation."""
     return bool(_DOTTED_RE.match(oid))
 
 
@@ -246,7 +247,8 @@ def _resolve_via_pysnmp(oid: str) -> Optional[str]:
         obj = ObjectIdentity(oid)
         obj.resolveWithMib(mib_view)
         return str(obj.getOid())
-    except Exception:
+    except Exception as exc:
+        log.debug("pysnmp MIB resolution failed for %r: %s", oid, exc)
         return None
 
 
@@ -334,10 +336,13 @@ class SNMPPoller:
     oids: List[OIDConfig]
 
     # ── runtime state (set by OPCUAServer during registration) ───────────────
-    _ns_idx: int = field(default=0, init=False, repr=False)
     _node_map: Dict[str, Any] = field(default_factory=dict, init=False, repr=False)
     _state_node: Any = field(default=None, init=False, repr=False)
     _snmp_engine: Any = field(default=None, init=False, repr=False)
+    # UdpTransportTarget is async to construct, so it is created lazily on the
+    # first poll and cached here.  ip/port/timeout/retries never change so one
+    # instance suffices for the lifetime of the poller.
+    _transport_target: Any = field(default=None, init=False, repr=False)
 
     # ── OID resolution cache ──────────────────────────────────────────────────
     # Maps opcua_name -> exact OID key string as returned by pysnmp.
@@ -349,6 +354,12 @@ class SNMPPoller:
     # ─────────────────────────────────────────────────────────────────────────
 
     def __post_init__(self) -> None:
+        if self.poll_interval <= 0:
+            raise ValueError(
+                f"poll_interval must be > 0, got {self.poll_interval!r} "
+                f"for poller {self.opcua_path!r}"
+            )
+
         # Create the SnmpEngine once and reuse it across all polls.
         # Recreating it on every call is heavyweight (dispatcher threads, etc.)
         # and leaks resources even when close_dispatcher() is called.
@@ -367,7 +378,15 @@ class SNMPPoller:
     @classmethod
     def from_dict(cls, cfg: dict) -> "SNMPPoller":
         """Construct from a plain configuration dictionary."""
-        oids = [OIDConfig(**o) for o in cfg["oids"]]
+        oids = []
+        for i, o in enumerate(cfg["oids"]):
+            try:
+                oids.append(OIDConfig(**o))
+            except TypeError as exc:
+                raise ValueError(
+                    f"OID entry {i} in poller {cfg.get('opcua_path', '?')!r} "
+                    f"has an unrecognised field: {exc}"
+                ) from exc
         return cls(
             ip=cfg["ip"],
             port=int(cfg.get("port", 161)),
@@ -397,15 +416,16 @@ class SNMPPoller:
         log.debug("SNMP GET %s:%d — requesting %d OID(s): %s",
                   self.ip, self.port, len(self.oids),
                   ", ".join(o.oid for o in self.oids))
-        # Re-use the engine that was created once in __post_init__.
-        # Do NOT call close_dispatcher() here — that would tear down the shared
-        # engine and break all subsequent polls on this poller.
+        # Re-use the engine and transport target created once; recreating them
+        # on every call is heavyweight and leaks resources.
+        if self._transport_target is None:
+            self._transport_target = await UdpTransportTarget.create(
+                (self.ip, self.port), timeout=2, retries=1
+            )
         error_indication, error_status, error_index, var_binds = await get_cmd(
             self._snmp_engine,
             CommunityData(self.community, mpModel=1),   # mpModel=1 → SNMPv2c
-            await UdpTransportTarget.create(
-                (self.ip, self.port), timeout=2, retries=1
-            ),
+            self._transport_target,
             ContextData(),
             *object_types,
         )
@@ -656,7 +676,13 @@ class _SingleUserManager:
             if UserRole is not None:
                 return UserRole.User
             return True      # asyncua 1.1.x: truthy value grants access
-        log.debug("OPC UA client authentication failed: user=%r", username)
+        # Failed auth is always worth seeing at normal log levels — it may
+        # indicate a misconfigured client or an unauthorised access attempt.
+        peer = getattr(iserver, "peer_name", None) or getattr(iserver, "peer", None)
+        if peer:
+            log.warning("OPC UA authentication failed: user=%r from %s", username, peer)
+        else:
+            log.warning("OPC UA authentication failed: user=%r", username)
         return None          # None/falsy -> deny
 
 
@@ -726,8 +752,9 @@ class OPCUAServer:
                     if await child.read_browse_name() == ua.QualifiedName(part, ns_idx):
                         found = child
                         break
-            except Exception:
-                pass
+            except Exception as exc:
+                log.warning("Error walking OPC UA address space at %r: %s — "
+                            "will attempt to create the node anyway", part, exc)
             if found is None:
                 found = await parent.add_object(ns_idx, part)
                 log.debug("Created OPC UA object node: %s", part)
@@ -777,7 +804,6 @@ class OPCUAServer:
             poller._state_node = state_node
 
             # ── configured OIDs ───────────────────────────────────────────────
-            poller._ns_idx = ns_idx
             for oid_cfg in poller.oids:
                 variant_type, _cast_fn = _UA_TYPE_MAP[oid_cfg.opcua_type]
                 # Create the node with a typed zero so asyncua knows the
@@ -847,10 +873,24 @@ class OPCUAServer:
 
         async with server:
             log.info("OPC UA server listening on %s", self.endpoint)
+
+            def _task_done(task: asyncio.Task) -> None:
+                # Called when a poller task exits for any reason.
+                # CancelledError is expected on shutdown; anything else is a bug.
+                if task.cancelled():
+                    return
+                exc = task.exception()
+                if exc is not None:
+                    log.error("Poller task %s crashed unexpectedly: %s: %s",
+                              task.get_name(), type(exc).__name__, exc,
+                              exc_info=exc)
+
             tasks = [
                 asyncio.create_task(poller.run(), name=f"poller-{poller.ip}")
                 for poller in self._pollers
             ]
+            for t in tasks:
+                t.add_done_callback(_task_done)
             log.debug("Launched %d poller task(s): %s",
                       len(tasks), ", ".join(t.get_name() for t in tasks))
             try:
@@ -1075,7 +1115,11 @@ async def async_main() -> None:
         log.info("No --device-config given — using built-in EXAMPLE_CONFIGS")
 
     for cfg in configs:
-        opcua_server.register(SNMPPoller.from_dict(cfg))
+        try:
+            opcua_server.register(SNMPPoller.from_dict(cfg))
+        except (ValueError, KeyError) as exc:
+            sys.exit(f"Invalid device configuration for "
+                     f"{cfg.get('opcua_path', cfg.get('ip', '?'))!r}: {exc}")
 
     await opcua_server.run()
 
