@@ -38,6 +38,7 @@ For production use, specify configuration files and options:
 python snmp_asyncua_bridge.py \
     --opcua-endpoint opc.tcp://0.0.0.0:4840/nectarcam/ \
     --opcua-namespace http://cta-observatory.org/nectarcam/snmpdevices/ \
+    --opcua-root SNMPDevices \
     --opcua-user admin:secret \
     --log-level INFO \
     --log-file bridge.log \
@@ -49,6 +50,7 @@ python snmp_asyncua_bridge.py \
 
 - `--opcua-endpoint`: OPC UA server endpoint URL (default: `opc.tcp://0.0.0.0:4840/nectarcam/`)
 - `--opcua-namespace`: OPC UA namespace URI (default: `http://cta-observatory.org/nectarcam/snmpdevices/`)
+- `--opcua-root`: Dot-separated OPC UA path of the container node created above all device objects (default: `SNMPDevices`). Pass an empty string to place devices directly under `Objects/`.
 - `--opcua-user`: Username and password for OPC UA authentication in `USER:PASS` format (optional, enables authentication)
 - `--log-level`: Logging level (DEBUG, INFO, WARNING, ERROR, CRITICAL; default: INFO)
 - `--log-file`: Optional log file path
@@ -66,7 +68,7 @@ Each device configuration is a JSON object with the following fields:
 - `port` (integer, optional): SNMP port (default: 161)
 - `community` (string, optional): SNMP community string (default: "public")
 - `description` (string, optional): Human-readable description of the device
-- `opcua_path` (string): OPC UA path relative to `SNMPDevices/`, e.g., `"Switch01"`. For multi-IP configurations, use `{instance}` for substitution.
+- `opcua_path` (string): Dot-separated OPC UA path relative to the root container (set by `--opcua-root`), e.g., `"Switch01"` or `"Switch.Monitoring"`. For multi-IP configurations, use `{instance}` for substitution.
 - `poll_interval` (number, optional): Polling interval in seconds (default: 10)
 - `oids` (array): List of OID configurations
 
@@ -78,6 +80,17 @@ Each OID in the `oids` array is a JSON object with:
 - `opcua_name` (string): Name of the OPC UA variable
 - `opcua_type` (string): OPC UA data type. Supported types: `Boolean`, `SByte`, `Byte`, `Int16`, `UInt16`, `Int32`, `UInt32`, `Int64`, `UInt64`, `Float`, `Double`, `String`, `ByteString`
 - `description` (string, optional): Description of the OID (default: "")
+
+## OPC UA Root Path
+
+The `--opcua-root` option controls the base path where all device objects are placed in the OPC UA address space. It is a dot-separated string that creates nested Object nodes under the server's `Objects/` folder.
+
+Examples:
+- `--opcua-root SNMPDevices` → Devices under `Objects/SNMPDevices/`
+- `--opcua-root Camera0.SNMPDevices` → Devices under `Objects/Camera0/SNMPDevices/`
+- `--opcua-root ""` → Devices directly under `Objects/`
+
+Each device's `opcua_path` is appended to this root path, allowing for hierarchical organization.
 
 ### Multi-IP Configurations
 
@@ -102,7 +115,7 @@ If `opcua_path` doesn't contain `{instance}`, a suffix `_{instance}` is automati
 {
   "ip": "192.168.1.10",
   "description": "Main distribution switch, rack A",
-  "opcua_path": "Switch01",
+  "opcua_path": "Switch.Monitoring",
   "oids": [
     {
       "oid": "SNMPv2-MIB::sysDescr.0",
@@ -143,12 +156,14 @@ You can define multiple devices in a single JSON file as an array:
 
 The bridge creates the following structure in the OPC UA server:
 
-- `SNMPDevices/` (root folder)
-  - `{opcua_path}/` (device folder)
+- `Objects/{root_path}/` (configurable root container)
+  - `{opcua_path}/` (device folder, can be multi-level)
     - `host` (String): Device IP address
     - `port` (UInt16): Device port
     - `cls_state` (Byte): Online state (1 = online, 0 = offline)
     - `{opcua_name}`: Configured OID variables
+
+For example, with `--opcua-root SNMPDevices` and `opcua_path: "Switch.Monitoring"`, the device variables would be under `Objects/SNMPDevices/Switch/Monitoring/`.
 
 All variables are read-only. Device state and OID values are updated automatically based on polling results.
 
