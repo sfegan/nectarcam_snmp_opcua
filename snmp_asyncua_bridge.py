@@ -38,6 +38,14 @@ Each SNMPPoller is built from a dict like:
                 "description": "System uptime in hundredths of a second",
             },
         ],
+        "constants": [                          # optional; written once at startup
+            {
+                "opcua_name":  "SoftwareVersion",
+                "opcua_type":  "String",
+                "value":       "2.0.0",
+                "description": "Firmware version of the device",   # optional
+            },
+        ],
     }
 
 OPC UA root path (--opcua-root)
@@ -71,6 +79,14 @@ spec is valid:
 
 If "ip" is an array and "opcua_path" does not contain {instance}, a
 warning is logged and "_{instance}" is appended automatically as a fallback.
+
+Within each entry in "constants", {instance} is substituted into the
+"value" field (when it is a string) and the "description" field, allowing
+per-device metadata such as serial numbers or slot identifiers:
+
+    "constants": [{"opcua_name": "SlotIndex", "opcua_type": "UInt16",
+                   "value": "{instance}",
+                   "description": "Physical slot {instance}"}]
 """
 
 from __future__ import annotations
@@ -325,8 +341,31 @@ class OIDConfig:
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# SNMPPoller
+# Constant variable configuration dataclass
 # ─────────────────────────────────────────────────────────────────────────────
+
+@dataclass
+class ConstantConfig:
+    """
+    A fixed OPC UA variable whose value is written once at startup and never
+    updated again.  Useful for metadata such as firmware version, serial number,
+    or any other static property of a device.
+
+    Both *value* and *description* support ``{instance}`` substitution when the
+    parent device config uses a multi-IP array (see _expand_multi_ip).
+    """
+    opcua_name: str           # variable name on the OPC UA side
+    opcua_type: str           # one of the keys in _UA_TYPE_MAP
+    value: Any                # the constant value to write (must be castable to opcua_type)
+    description: str = ""
+
+    def __post_init__(self):
+        if self.opcua_type not in _UA_TYPE_MAP:
+            raise ValueError(
+                f"Unknown opcua_type '{self.opcua_type}' for constant "
+                f"'{self.opcua_name}'. Valid types: {list(_UA_TYPE_MAP)}"
+            )
+
 
 @dataclass
 class SNMPPoller:
@@ -337,6 +376,9 @@ class SNMPPoller:
       • host       (String)  – IP address of the device
       • port       (UInt16)  – UDP port of the SNMP agent
       • cls_state  (Byte)    – 0 = offline, 1 = online
+
+    Optional constants (see ConstantConfig) are written once at address-space
+    build time and never touched again.
     """
 
     # ── config ────────────────────────────────────────────────────────────────
@@ -347,6 +389,7 @@ class SNMPPoller:
     opcua_path: str           # dot-separated path relative to SNMPDevices/, e.g. "Switch01"
     poll_interval: float      # seconds
     oids: List[OIDConfig]
+    constants: List[ConstantConfig] = field(default_factory=list)
 
     # ── runtime state (set by OPCUAServer during registration) ───────────────
     _node_map: Dict[str, Any] = field(default_factory=dict, init=False, repr=False)
@@ -378,8 +421,9 @@ class SNMPPoller:
         # and leaks resources even when close_dispatcher() is called.
         self._snmp_engine = SnmpEngine()
 
-        # Detect duplicate opcua_name values within this poller's OID list.
-        # Duplicates would silently overwrite each other's OPC UA node.
+        # Detect duplicate opcua_name values within this poller's OID list and
+        # constants.  Duplicates across either list would silently overwrite
+        # each other's OPC UA node.
         seen: set[str] = set()
         for o in self.oids:
             if o.opcua_name in seen:
@@ -387,6 +431,13 @@ class SNMPPoller:
                     f"Duplicate opcua_name {o.opcua_name!r} in poller {self.opcua_path!r}"
                 )
             seen.add(o.opcua_name)
+        for c in self.constants:
+            if c.opcua_name in seen:
+                raise ValueError(
+                    f"Duplicate opcua_name {c.opcua_name!r} in poller {self.opcua_path!r} "
+                    f"(conflicts with an OID or another constant)"
+                )
+            seen.add(c.opcua_name)
 
     @classmethod
     def from_dict(cls, cfg: dict) -> "SNMPPoller":
@@ -400,6 +451,15 @@ class SNMPPoller:
                     f"OID entry {i} in poller {cfg.get('opcua_path', '?')!r} "
                     f"has an unrecognised field: {exc}"
                 ) from exc
+        constants = []
+        for i, c in enumerate(cfg.get("constants", [])):
+            try:
+                constants.append(ConstantConfig(**c))
+            except TypeError as exc:
+                raise ValueError(
+                    f"Constant entry {i} in poller {cfg.get('opcua_path', '?')!r} "
+                    f"has an unrecognised field: {exc}"
+                ) from exc
         return cls(
             ip=cfg["ip"],
             port=int(cfg.get("port", 161)),
@@ -408,6 +468,7 @@ class SNMPPoller:
             opcua_path=cfg["opcua_path"],
             poll_interval=float(cfg.get("poll_interval", 10)),
             oids=oids,
+            constants=constants,
         )
 
     # ── SNMP helpers ──────────────────────────────────────────────────────────
@@ -860,7 +921,37 @@ class OPCUAServer:
                           poller.opcua_path, oid_cfg.opcua_name,
                           oid_cfg.opcua_type, var_node.nodeid)
 
-            log.info("Address space built for %s", poller.opcua_path)
+            # ── constants ─────────────────────────────────────────────────────
+            # Written once here and never touched again — no entry in _node_map.
+            for const_cfg in poller.constants:
+                variant = _cast_to_ua(const_cfg.value, const_cfg.opcua_type)
+                if isinstance(variant, ua.DataValue):
+                    # _cast_to_ua returns a DataValue only on cast failure.
+                    raise ValueError(
+                        f"Constant {const_cfg.opcua_name!r} in poller "
+                        f"{poller.opcua_path!r}: value {const_cfg.value!r} "
+                        f"cannot be cast to {const_cfg.opcua_type}"
+                    )
+                const_node = await device_node.add_variable(
+                    ns_idx, const_cfg.opcua_name, variant
+                )
+                await const_node.set_writable(False)
+                if const_cfg.description:
+                    await const_node.write_attribute(
+                        ua.AttributeIds.Description,
+                        ua.DataValue(
+                            ua.Variant(
+                                ua.LocalizedText(const_cfg.description),
+                                ua.VariantType.LocalizedText,
+                            )
+                        ),
+                    )
+                log.debug("  OPC UA constant: %s.%s = %r (%s)  node_id=%s",
+                          poller.opcua_path, const_cfg.opcua_name,
+                          const_cfg.value, const_cfg.opcua_type, const_node.nodeid)
+
+            log.info("Address space built for %s (%d OID(s), %d constant(s))",
+                     poller.opcua_path, len(poller.oids), len(poller.constants))
 
     # ── main entry point ──────────────────────────────────────────────────────
 
@@ -1030,6 +1121,9 @@ def _expand_multi_ip(cfg: dict) -> List[dict]:
     substituting {instance} (zero-based index) into "opcua_path" and
     "description" via str.format_map().
 
+    Within each entry in "constants", {instance} is also substituted into
+    the "value" and "description" fields (when they are strings).
+
     If "opcua_path" does not contain {instance}, a warning is logged and
     "_{instance}" is appended automatically to avoid duplicate OPC UA paths.
 
@@ -1069,6 +1163,32 @@ def _expand_multi_ip(cfg: dict) -> List[dict]:
                 instance_cfg["description"] = desc.format_map(fmt)
             except (KeyError, ValueError) as exc:
                 sys.exit(f'Bad description template {desc!r}: {exc}')
+
+        # Apply {instance} substitution to each constant's "value" (strings
+        # only) and "description" fields.
+        if cfg.get("constants"):
+            expanded_constants = []
+            for i, c in enumerate(cfg["constants"]):
+                c_out = dict(c)
+                if isinstance(c.get("value"), str):
+                    try:
+                        c_out["value"] = c["value"].format_map(fmt)
+                    except (KeyError, ValueError) as exc:
+                        sys.exit(
+                            f'Bad value template {c["value"]!r} in constant '
+                            f'{c.get("opcua_name", i)!r}: {exc}'
+                        )
+                if c.get("description"):
+                    try:
+                        c_out["description"] = c["description"].format_map(fmt)
+                    except (KeyError, ValueError) as exc:
+                        sys.exit(
+                            f'Bad description template {c["description"]!r} in constant '
+                            f'{c.get("opcua_name", i)!r}: {exc}'
+                        )
+                expanded_constants.append(c_out)
+            instance_cfg["constants"] = expanded_constants
+
         expanded.append(instance_cfg)
         log.debug("Expanded multi-IP config: ip=%s opcua_path=%s",
                   address, instance_cfg["opcua_path"])
