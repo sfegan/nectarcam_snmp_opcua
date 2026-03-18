@@ -22,6 +22,8 @@ Install the required dependencies:
 pip install pysnmp-lextudio asyncua
 ```
 
+For symbolic OID name resolution, install `net-snmp` (provides `snmptranslate`) or ensure pysnmp's built-in MIBs are sufficient. Symbolic names like `"SNMPv2-MIB::sysDescr.0"` are automatically converted to numeric OIDs at startup.
+
 ## Usage
 
 Run the bridge with default settings:
@@ -72,10 +74,10 @@ Each device configuration is a JSON object with the following fields:
 
 Each OID in the `oids` array is a JSON object with:
 
-- `oid` (string): Dotted-decimal OID string, e.g., `"1.3.6.1.2.1.1.1.0"`
+- `oid` (string): OID identifier, either in dotted-decimal notation (e.g., `"1.3.6.1.2.1.1.1.0"`) or symbolic name (e.g., `"SNMPv2-MIB::sysDescr.0"`). Symbolic names are automatically resolved to numeric form at startup.
 - `opcua_name` (string): Name of the OPC UA variable
 - `opcua_type` (string): OPC UA data type. Supported types: `Boolean`, `SByte`, `Byte`, `Int16`, `UInt16`, `Int32`, `UInt32`, `Int64`, `UInt64`, `Float`, `Double`, `String`, `ByteString`
-- `description` (string, optional): Description of the OID
+- `description` (string, optional): Description of the OID (default: "")
 
 ### Multi-IP Configurations
 
@@ -103,13 +105,13 @@ If `opcua_path` doesn't contain `{instance}`, a suffix `_{instance}` is automati
   "opcua_path": "Switch01",
   "oids": [
     {
-      "oid": "1.3.6.1.2.1.1.1.0",
+      "oid": "SNMPv2-MIB::sysDescr.0",
       "opcua_name": "sysDescr",
       "opcua_type": "String",
       "description": "System description"
     },
     {
-      "oid": "1.3.6.1.2.1.1.3.0",
+      "oid": "SNMPv2-MIB::sysUpTime.0",
       "opcua_name": "sysUpTime",
       "opcua_type": "UInt32",
       "description": "System uptime in hundredths of a second"
