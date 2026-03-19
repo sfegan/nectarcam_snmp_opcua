@@ -205,7 +205,7 @@ def _snmp_value_to_python(raw_value: Any) -> Any:
                                Counter32, Counter64, Gauge32, Unsigned32)):
         return int(raw_value)
     if isinstance(raw_value, IpAddress):
-        return str(raw_value)
+        return raw_value.prettyPrint()   # gives "10.10.3.250", not raw bytes
     if isinstance(raw_value, OctetString):
         return bytes(raw_value)
     return raw_value.prettyPrint()
