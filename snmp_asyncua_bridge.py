@@ -1083,67 +1083,59 @@ class SNMPPoller:
                   oid_cfg.oid, list(results))
         return None
 
-    def _apply_staleness(self, now: float, oids: Optional[List[OIDConfig]] = None) -> None:
+    def _apply_staleness(self, opcua_name: str, entry: "StoreEntry", now: float) -> None:
         """
-        Update the status of OID store entries that were not refreshed this
-        cycle, according to each entry's timestamp and lifetime.
+        Apply staleness logic to a single store entry that was not refreshed
+        this poll cycle.  Mutates ``entry.data_value`` in place.
+
+        This method is intentionally scoped to one entry so that callers
+        control iteration and subclasses can apply the same logic to any
+        store entry they manage (not just OID variables).
 
         Rules
         -----
-        • Entry has never been successfully read (timestamp is None):
-              Leave unchanged — keeps BadWaitingForInitialData.
-        • Entry has a prior value AND lifetime not expired:
+        • Never successfully read (timestamp is None):
+              Left unchanged — keeps BadWaitingForInitialData.
+        • BadNotSupported: permanent — never overwritten.
+        • Has a prior value, within lifetime (or lifetime == 0):
               status → UncertainLastUsableValue, value preserved.
-        • Entry has a prior value AND lifetime expired (ml > 0, elapsed > ml):
-              status → BadNoCommunication, value → None.
-        • BadNotSupported: permanent — never touched by staleness logic.
-        • Any already-bad status with no value: leave unchanged.
+        • Has a prior value, lifetime expired (lifetime > 0, elapsed > lifetime):
+              status → BadNoCommunication, value → typed zero.
         """
-        _uncertain    = ua.StatusCode(ua.StatusCodes.UncertainLastUsableValue)
-        _bad_no_comm  = ua.StatusCode(ua.StatusCodes.BadNoCommunication)
-        _bad_no_supp  = ua.StatusCode(ua.StatusCodes.BadNotSupported)
+        _uncertain   = ua.StatusCode(ua.StatusCodes.UncertainLastUsableValue)
+        _bad_no_comm = ua.StatusCode(ua.StatusCodes.BadNoCommunication)
+        _bad_no_supp = ua.StatusCode(ua.StatusCodes.BadNotSupported)
 
-        for oid_cfg in (oids if oids is not None else self.oids):
-            entry = self._store.get(oid_cfg.opcua_name)
-            if entry is None:
-                continue
+        if entry.data_value.StatusCode == _bad_no_supp:
+            return   # permanent — never overwrite
 
-            # Permanent bad status — never overwrite
-            if entry.data_value.StatusCode == _bad_no_supp:
-                continue
+        if entry.timestamp is None:
+            return   # never successfully read — leave as BadWaitingForInitialData
 
-            # Never successfully read — leave as BadWaitingForInitialData
-            if entry.timestamp is None:
-                continue
+        elapsed = now - entry.timestamp
 
-            # Has a prior good value — check lifetime
-            ml = entry.lifetime
-            elapsed = now - entry.timestamp
-
-            if ml > 0 and elapsed > ml:
-                # Lifetime expired — write typed zero with bad status
-                if entry.data_value.StatusCode != _bad_no_comm:
-                    log.debug(
-                        "Lifetime expired for %s.%s (last read %.1fs ago, limit %.1fs)"
-                        " — marking BadNoCommunication",
-                        self.opcua_path, oid_cfg.opcua_name, elapsed, ml,
-                    )
-                entry.data_value = ua.DataValue(
-                    Value=ua.Variant(
-                        _UA_TYPE_ZEROS.get(entry.opcua_type, ""),
-                        _UA_TYPE_MAP[entry.opcua_type][0],
-                    ),
-                    StatusCode_=_bad_no_comm,
+        if entry.lifetime > 0 and elapsed > entry.lifetime:
+            if entry.data_value.StatusCode != _bad_no_comm:
+                log.debug(
+                    "Lifetime expired for %s.%s (last read %.1fs ago, limit %.1fs)"
+                    " — marking BadNoCommunication",
+                    self.opcua_path, opcua_name, elapsed, entry.lifetime,
                 )
-            else:
-                # Within lifetime (or never-expire) — preserve value, mark uncertain
-                if entry.data_value.StatusCode != _uncertain:
-                    log.debug("Marking %s.%s UncertainLastUsableValue",
-                              self.opcua_path, oid_cfg.opcua_name)
-                entry.data_value = ua.DataValue(
-                    Value=entry.data_value.Value,
-                    StatusCode_=_uncertain,
-                )
+            entry.data_value = ua.DataValue(
+                Value=ua.Variant(
+                    _UA_TYPE_ZEROS.get(entry.opcua_type, ""),
+                    _UA_TYPE_MAP[entry.opcua_type][0],
+                ),
+                StatusCode_=_bad_no_comm,
+            )
+        else:
+            if entry.data_value.StatusCode != _uncertain:
+                log.debug("Marking %s.%s UncertainLastUsableValue",
+                          self.opcua_path, opcua_name)
+            entry.data_value = ua.DataValue(
+                Value=entry.data_value.Value,
+                StatusCode_=_uncertain,
+            )
 
     async def _poll_once(self) -> None:
         """
@@ -1159,7 +1151,7 @@ class SNMPPoller:
         • On a successful response: update store entries for every OID that
           replied, resolve and cache OID keys on the first post-offline cycle.
         • On a failed response (device offline): apply staleness / lifetime
-          expiry to all OID store entries via _apply_staleness().
+          expiry to each OID store entry via _apply_staleness().
         • Update cls_state (1 = online, 0 = offline) in the store.
         • Call write_variables() once at the end of every cycle.
 
@@ -1179,7 +1171,10 @@ class SNMPPoller:
                 self._was_offline = True
 
             log.debug("Device offline: %s", self.ip)
-            self._apply_staleness(now)  # processes all self.oids
+            for oid_cfg in self.oids:
+                entry = self._store.get(oid_cfg.opcua_name)
+                if entry is not None:
+                    self._apply_staleness(oid_cfg.opcua_name, entry, now)
 
             self._store["cls_state"].data_value = ua.DataValue(
                 ua.Variant(0, ua.VariantType.Byte)
@@ -1250,13 +1245,12 @@ class SNMPPoller:
             responded.add(oid_cfg.opcua_name)
 
         # ── Apply staleness to OIDs that did not respond this cycle ───────────
-        missing = [
-            oid_cfg for oid_cfg in self.oids
-            if oid_cfg.opcua_name not in responded
-            and self._oid_key_cache.get(oid_cfg.opcua_name) is not None
-        ]
-        if missing:
-            self._apply_staleness(now, oids=missing)
+        for oid_cfg in self.oids:
+            if oid_cfg.opcua_name not in responded \
+                    and self._oid_key_cache.get(oid_cfg.opcua_name) is not None:
+                entry = self._store.get(oid_cfg.opcua_name)
+                if entry is not None:
+                    self._apply_staleness(oid_cfg.opcua_name, entry, now)
 
         # ── Update polling_timestamp and polling_age on success ───────────────
         # Stamped with the initiation time of this cycle (now), so polling_age
