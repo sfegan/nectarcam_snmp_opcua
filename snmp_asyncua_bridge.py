@@ -367,6 +367,36 @@ class ConstantConfig:
             )
 
 
+# ─────────────────────────────────────────────────────────────────────────────
+# Node specification dataclass  (used by build_variable_specs / create_variables)
+# ─────────────────────────────────────────────────────────────────────────────
+
+@dataclass
+class NodeSpec:
+    """
+    Describes a single OPC UA variable to be created under a device node.
+
+    Produced by SNMPPoller.build_variable_specs() and consumed by
+    SNMPPoller.create_variables().  Subclasses may add, remove, or modify
+    entries in the spec dict before create_variables() is called.
+
+    Fields
+    ------
+    opcua_type    One of the keys in _UA_TYPE_MAP (e.g. "String", "UInt32").
+    initial_value The value written at node creation.  For SNMP-polled variables
+                  this is a typed zero / empty so asyncua knows the VariantType;
+                  the node is immediately overwritten with BadWaitingForInitialData.
+                  For constants this is the actual constant value.
+    description   Written to the node's Description attribute if non-empty.
+    initial_status Optional OPC UA status code written right after creation.
+                  None means "leave at Good / the value written by add_variable".
+    """
+    opcua_type:     str
+    initial_value:  Any
+    description:    str = ""
+    initial_status: Optional[ua.StatusCode] = None
+
+
 @dataclass
 class SNMPPoller:
     """
@@ -377,8 +407,19 @@ class SNMPPoller:
       • port       (UInt16)  – UDP port of the SNMP agent
       • cls_state  (Byte)    – 0 = offline, 1 = online
 
-    Optional constants (see ConstantConfig) are written once at address-space
-    build time and never touched again.
+    Optional constants (see ConstantConfig) are created alongside polled
+    variables and included in _node_map so they can be updated via
+    write_variables() like any other node.
+
+    Subclassing hooks
+    -----------------
+    build_variable_specs()  Override to add, remove, or modify the NodeSpec
+                            dict before nodes are created.
+    create_variables()      Override to customise how nodes are actually
+                            created (e.g. add nodes outside the spec dict).
+    write_variables()       Override to intercept, modify, or suppress writes
+                            to OPC UA on every poll cycle.
+    on_address_space_ready() Called once after all nodes have been created.
     """
 
     # ── config ────────────────────────────────────────────────────────────────
@@ -386,14 +427,16 @@ class SNMPPoller:
     port: int
     community: str
     description: str          # human-readable device description (written to OPC UA object)
-    opcua_path: str           # dot-separated path relative to SNMPDevices/, e.g. "Switch01"
+    opcua_path: str           # dot-separated path relative to root, e.g. "Switch01"
     poll_interval: float      # seconds
     oids: List[OIDConfig]
     constants: List[ConstantConfig] = field(default_factory=list)
 
     # ── runtime state (set by OPCUAServer during registration) ───────────────
     _node_map: Dict[str, Any] = field(default_factory=dict, init=False, repr=False)
-    _state_node: Any = field(default=None, init=False, repr=False)
+    # The asyncua Object node for this device — available to subclasses from
+    # on_address_space_ready() onwards.
+    _device_node: Any = field(default=None, init=False, repr=False)
     _snmp_engine: Any = field(default=None, init=False, repr=False)
     # UdpTransportTarget is async to construct, so it is created lazily on the
     # first poll and cached here.  ip/port/timeout/retries never change so one
@@ -470,6 +513,151 @@ class SNMPPoller:
             oids=oids,
             constants=constants,
         )
+
+    # ── subclassing hooks ─────────────────────────────────────────────────────
+
+    def build_variable_specs(self) -> Dict[str, "NodeSpec"]:
+        """
+        Build and return the complete dict of NodeSpecs for this poller.
+
+        Keys are opcua_name strings.  The dict is ordered: built-ins first
+        (host, port, cls_state), then OID variables, then constants.
+
+        Override to add, remove, or modify specs before node creation.
+        Entries added here with names that also appear in _node_map will be
+        available to write_variables() automatically.
+        """
+        specs: Dict[str, NodeSpec] = {}
+
+        # ── built-in metadata variables ───────────────────────────────────────
+        specs["host"] = NodeSpec(
+            opcua_type="String",
+            initial_value=self.ip,
+            description="IP address of the SNMP device",
+        )
+        specs["port"] = NodeSpec(
+            opcua_type="UInt16",
+            initial_value=self.port,
+            description="UDP port of the SNMP agent",
+        )
+        specs["cls_state"] = NodeSpec(
+            opcua_type="Byte",
+            initial_value=0,
+            description="Device state: 0 = offline, 1 = online",
+        )
+
+        # ── SNMP-polled OID variables ─────────────────────────────────────────
+        for oid_cfg in self.oids:
+            _variant_type, cast_fn = _UA_TYPE_MAP[oid_cfg.opcua_type]
+            try:
+                zero = cast_fn(0)
+            except (ValueError, TypeError):
+                zero = cast_fn()    # e.g. str(), bytes()
+            specs[oid_cfg.opcua_name] = NodeSpec(
+                opcua_type=oid_cfg.opcua_type,
+                initial_value=zero,
+                description=oid_cfg.description,
+                initial_status=ua.StatusCode(ua.StatusCodes.BadWaitingForInitialData),
+            )
+
+        # ── constants ─────────────────────────────────────────────────────────
+        for const_cfg in self.constants:
+            variant = _cast_to_ua(const_cfg.value, const_cfg.opcua_type)
+            if isinstance(variant, ua.DataValue):
+                raise ValueError(
+                    f"Constant {const_cfg.opcua_name!r} in poller "
+                    f"{self.opcua_path!r}: value {const_cfg.value!r} "
+                    f"cannot be cast to {const_cfg.opcua_type}"
+                )
+            specs[const_cfg.opcua_name] = NodeSpec(
+                opcua_type=const_cfg.opcua_type,
+                initial_value=const_cfg.value,
+                description=const_cfg.description,
+            )
+
+        return specs
+
+    async def create_variables(
+        self,
+        device_node: Any,
+        ns_idx: int,
+        specs: Dict[str, "NodeSpec"],
+    ) -> None:
+        """
+        Create OPC UA variable nodes from *specs* under *device_node* and
+        register them in self._node_map.
+
+        Override to customise node creation — e.g. to set different access
+        levels or add nodes that live outside the spec dict entirely.  Call
+        super() to let the base implementation handle the standard specs, then
+        add your extra nodes afterwards.
+        """
+        for opcua_name, spec in specs.items():
+            variant_type, _cast_fn = _UA_TYPE_MAP[spec.opcua_type]
+            var_node = await device_node.add_variable(
+                ns_idx,
+                opcua_name,
+                ua.Variant(spec.initial_value, variant_type),
+            )
+            await var_node.set_writable(False)
+            if spec.initial_status is not None:
+                await var_node.write_value(
+                    ua.DataValue(StatusCode_=spec.initial_status)
+                )
+            if spec.description:
+                await var_node.write_attribute(
+                    ua.AttributeIds.Description,
+                    ua.DataValue(
+                        ua.Variant(
+                            ua.LocalizedText(spec.description),
+                            ua.VariantType.LocalizedText,
+                        )
+                    ),
+                )
+            self._node_map[opcua_name] = var_node
+            log.debug("  OPC UA variable: %s.%s (%s)  node_id=%s",
+                      self.opcua_path, opcua_name, spec.opcua_type, var_node.nodeid)
+
+    async def write_variables(self, values: Dict[str, ua.DataValue]) -> None:
+        """
+        Write a batch of OPC UA values to their nodes.
+
+        *values* maps opcua_name → ua.DataValue.  Only names present in
+        _node_map are written; unknown names are silently ignored, so subclasses
+        can safely pass extra entries without causing errors.
+
+        Override to intercept all writes — good values, stale markers, bad
+        status codes — on every poll cycle.  Modify, suppress, or augment
+        entries, then call super() to perform the actual writes.
+
+        Example — derive a computed variable and suppress a raw OID write::
+
+            async def write_variables(self, values):
+                raw = values.pop("rawPower", None)
+                if raw is not None and raw.Value is not None:
+                    computed = ua.Variant(raw.Value.Value * 1000, ua.VariantType.Float)
+                    values["PowerMilliWatts"] = ua.DataValue(computed)
+                await super().write_variables(values)
+        """
+        for opcua_name, data_value in values.items():
+            node = self._node_map.get(opcua_name)
+            if node is None:
+                continue
+            log.debug("  Writing %s.%s = %s", self.opcua_path, opcua_name, data_value)
+            try:
+                await node.write_value(data_value)
+            except Exception as exc:
+                log.error("OPC UA write failed for %s.%s: %s",
+                          self.opcua_path, opcua_name, exc)
+
+    async def on_address_space_ready(self) -> None:
+        """
+        Called once after all OPC UA nodes have been created for this poller.
+
+        self._device_node and self._node_map are fully populated at this point.
+        Override to perform any one-time setup that requires access to the
+        node tree — e.g. reading existing values or creating subscriptions.
+        """
 
     # ── SNMP helpers ──────────────────────────────────────────────────────────
 
@@ -572,8 +760,11 @@ class SNMPPoller:
         while True:
             log.debug("Poller %s: starting cycle %d", self.ip, cycle + 1)
             online = await self._poll_once()
-            state_val = ua.Variant(1 if online else 0, ua.VariantType.Byte)
-            await self._state_node.write_value(state_val)
+            await self.write_variables({
+                "cls_state": ua.DataValue(
+                    ua.Variant(1 if online else 0, ua.VariantType.Byte)
+                )
+            })
 
             cycle += 1
             next_deadline = origin + cycle * self.poll_interval
@@ -618,7 +809,9 @@ class SNMPPoller:
 
     async def _poll_once(self) -> bool:
         """
-        Fetch all configured OIDs in one bulk GET and write results to OPC UA.
+        Fetch all configured OIDs in one bulk GET, build a values dict of
+        opcua_name → ua.DataValue for every node that needs updating, then
+        hand the whole dict to write_variables() in one call.
 
         OID key resolution is performed on the first successful poll after the
         device was offline, then cached for subsequent cycles.  The cache is
@@ -637,26 +830,30 @@ class SNMPPoller:
         if results is None:
             # Complete transport failure — device offline
             if not self._was_offline:
-                # Transition online → offline: stamp resolved nodes as stale.
-                # UncertainLastUsableValue is not a bad status code, so asyncua
-                # still enforces the type check on the Value field — we must
-                # supply the correct typed variant.  We read the current DataValue
-                # from each node and reuse its Value, replacing only the status.
                 log.warning("Device went offline: %s", self.ip)
+                # Stamp all previously-resolved nodes as stale.
+                # UncertainLastUsableValue is not a bad status code, so asyncua
+                # still enforces the type check on Value — we must read and
+                # reuse each node's current Value, replacing only the status.
                 _uncertain = ua.StatusCode(ua.StatusCodes.UncertainLastUsableValue)
-                for opcua_name, _key in self._oid_key_cache.items():
+                values: Dict[str, ua.DataValue] = {}
+                for opcua_name in self._oid_key_cache:
                     node = self._node_map.get(opcua_name)
                     if node is not None:
                         try:
                             current_dv = await node.read_data_value()
-                            stale_dv = ua.DataValue(
+                            values[opcua_name] = ua.DataValue(
                                 Value=current_dv.Value,
                                 StatusCode_=_uncertain,
                             )
-                            await node.write_value(stale_dv)
                         except Exception as exc:
-                            log.error("Failed to write UncertainLastUsableValue for %s.%s: %s",
-                                      self.opcua_path, opcua_name, exc)
+                            log.error(
+                                "Failed to read current value for %s.%s "
+                                "during offline transition: %s",
+                                self.opcua_path, opcua_name, exc,
+                            )
+                if values:
+                    await self.write_variables(values)
                 self._oid_key_cache.clear()
                 self._was_offline = True
             else:
@@ -665,9 +862,11 @@ class SNMPPoller:
 
         # ── Device is responding ──────────────────────────────────────────────
         if self._was_offline:
-            # Transition offline → online: resolve and cache OID keys
+            # Transition offline → online: resolve and cache OID keys.
+            # Any OID the agent doesn't support gets BadNotSupported immediately.
             log.info("Device came online: %s — resolving OID keys", self.ip)
             self._oid_key_cache.clear()
+            bad_status_values: Dict[str, ua.DataValue] = {}
             for oid_cfg in self.oids:
                 key = self._resolve_oid_key(oid_cfg, results)
                 if key is not None:
@@ -677,32 +876,26 @@ class SNMPPoller:
                 else:
                     log.warning("OID not supported by device – marking BadNotSupported: "
                                 "%s on %s", oid_cfg.oid, self.ip)
-                    node = self._node_map.get(oid_cfg.opcua_name)
-                    if node is not None:
-                        try:
-                            # BadNotSupported is a bad status code so asyncua
-                            # bypasses the type check and forces Value to null
-                            # server-side — no need to read the current value first.
-                            await node.write_value(ua.DataValue(
-                                StatusCode_=ua.StatusCode(ua.StatusCodes.BadNotSupported),
-                            ))
-                        except Exception as exc:
-                            log.error("Failed to write BadNotSupported for %s.%s: %s",
-                                      self.opcua_path, oid_cfg.opcua_name, exc)
+                    # BadNotSupported is a bad status code — asyncua bypasses the
+                    # type check and forces Value to null server-side.
+                    bad_status_values[oid_cfg.opcua_name] = ua.DataValue(
+                        StatusCode_=ua.StatusCode(ua.StatusCodes.BadNotSupported)
+                    )
+            if bad_status_values:
+                await self.write_variables(bad_status_values)
             self._was_offline = False
 
-        # ── Write values to OPC UA ────────────────────────────────────────────
+        # ── Build and dispatch the values dict ────────────────────────────────
         any_ok = False
+        values = {}
         for oid_cfg in self.oids:
             key = self._oid_key_cache.get(oid_cfg.opcua_name)
-            node = self._node_map.get(oid_cfg.opcua_name)
-            if node is None or key is None:
-                continue
+            if key is None:
+                continue    # OID marked BadNotSupported at startup
 
             raw = results.get(key)
             if raw is None:
-                # Key resolved correctly at startup but absent in this response;
-                # log and leave the node at its current status until next cycle.
+                # Key resolved correctly at startup but absent in this response.
                 log.warning("Cached OID key no longer in response: %s on %s",
                             key, self.ip)
                 continue
@@ -710,14 +903,17 @@ class SNMPPoller:
             any_ok = True
             py_val = _snmp_value_to_python(raw)
             variant = _cast_to_ua(py_val, oid_cfg.opcua_type)
-            log.debug("  Writing %s.%s = %r (raw type: %s)",
+            log.debug("  Queuing %s.%s = %r (raw type: %s)",
                       self.opcua_path, oid_cfg.opcua_name,
                       py_val, type(raw).__name__)
-            try:
-                await node.write_value(variant)
-            except Exception as exc:
-                log.error("OPC UA write failed for %s.%s: %s",
-                          self.opcua_path, oid_cfg.opcua_name, exc)
+            # _cast_to_ua returns ua.Variant on success, ua.DataValue on failure
+            if isinstance(variant, ua.Variant):
+                values[oid_cfg.opcua_name] = ua.DataValue(variant)
+            else:
+                values[oid_cfg.opcua_name] = variant   # already a DataValue (bad status)
+
+        if values:
+            await self.write_variables(values)
 
         return any_ok
 
@@ -856,6 +1052,7 @@ class OPCUAServer:
             device_node = await self._ensure_path(
                 server, ns_idx, self.root_parts + poller_parts
             )
+            poller._device_node = device_node
 
             # ── device description on the object node ─────────────────────────
             if poller.description:
@@ -869,89 +1066,13 @@ class OPCUAServer:
                     ),
                 )
 
-            # ── built-in variables ────────────────────────────────────────────
-            host_node = await device_node.add_variable(
-                ns_idx, "host", ua.Variant(poller.ip, ua.VariantType.String)
-            )
-            await host_node.set_writable(False)
+            # ── build specs, create nodes, notify poller ──────────────────────
+            specs = poller.build_variable_specs()
+            await poller.create_variables(device_node, ns_idx, specs)
+            await poller.on_address_space_ready()
 
-            port_node = await device_node.add_variable(
-                ns_idx, "port", ua.Variant(poller.port, ua.VariantType.UInt16)
-            )
-            await port_node.set_writable(False)
-
-            state_node = await device_node.add_variable(
-                ns_idx, "cls_state", ua.Variant(0, ua.VariantType.Byte)
-            )
-            await state_node.set_writable(False)
-            poller._state_node = state_node
-
-            # ── configured OIDs ───────────────────────────────────────────────
-            for oid_cfg in poller.oids:
-                variant_type, _cast_fn = _UA_TYPE_MAP[oid_cfg.opcua_type]
-                # Create the node with a typed zero so asyncua knows the
-                # correct VariantType, then immediately overwrite the status
-                # to BadWaitingForInitialData so clients see the node as
-                # uninitialised until the first successful poll arrives.
-                try:
-                    zero = _cast_fn(0)
-                except (ValueError, TypeError):
-                    zero = _cast_fn()   # e.g. str(), bytes()
-                var_node = await device_node.add_variable(
-                    ns_idx,
-                    oid_cfg.opcua_name,
-                    ua.Variant(zero, variant_type),
-                )
-                await var_node.set_writable(False)
-                await var_node.write_value(ua.DataValue(
-                    StatusCode_=ua.StatusCode(ua.StatusCodes.BadWaitingForInitialData),
-                ))
-                if oid_cfg.description:
-                    await var_node.write_attribute(
-                        ua.AttributeIds.Description,
-                        ua.DataValue(
-                            ua.Variant(
-                                ua.LocalizedText(oid_cfg.description),
-                                ua.VariantType.LocalizedText,
-                            )
-                        ),
-                    )
-                poller._node_map[oid_cfg.opcua_name] = var_node
-                log.debug("  OPC UA variable: %s.%s (%s)  node_id=%s",
-                          poller.opcua_path, oid_cfg.opcua_name,
-                          oid_cfg.opcua_type, var_node.nodeid)
-
-            # ── constants ─────────────────────────────────────────────────────
-            # Written once here and never touched again — no entry in _node_map.
-            for const_cfg in poller.constants:
-                variant = _cast_to_ua(const_cfg.value, const_cfg.opcua_type)
-                if isinstance(variant, ua.DataValue):
-                    # _cast_to_ua returns a DataValue only on cast failure.
-                    raise ValueError(
-                        f"Constant {const_cfg.opcua_name!r} in poller "
-                        f"{poller.opcua_path!r}: value {const_cfg.value!r} "
-                        f"cannot be cast to {const_cfg.opcua_type}"
-                    )
-                const_node = await device_node.add_variable(
-                    ns_idx, const_cfg.opcua_name, variant
-                )
-                await const_node.set_writable(False)
-                if const_cfg.description:
-                    await const_node.write_attribute(
-                        ua.AttributeIds.Description,
-                        ua.DataValue(
-                            ua.Variant(
-                                ua.LocalizedText(const_cfg.description),
-                                ua.VariantType.LocalizedText,
-                            )
-                        ),
-                    )
-                log.debug("  OPC UA constant: %s.%s = %r (%s)  node_id=%s",
-                          poller.opcua_path, const_cfg.opcua_name,
-                          const_cfg.value, const_cfg.opcua_type, const_node.nodeid)
-
-            log.info("Address space built for %s (%d OID(s), %d constant(s))",
-                     poller.opcua_path, len(poller.oids), len(poller.constants))
+            log.info("Address space built for %s (%d variable(s))",
+                     poller.opcua_path, len(poller._node_map))
 
     # ── main entry point ──────────────────────────────────────────────────────
 
