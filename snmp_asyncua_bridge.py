@@ -189,6 +189,25 @@ _UA_TYPE_MAP: Dict[str, tuple[ua.VariantType, Any]] = {
     "ByteString": (ua.VariantType.ByteString, bytes),
 }
 
+# Typed zero values for each OPC UA type -- used when a constant is declared
+# with value=None (BadWaitingForInitialData) so asyncua can infer the VariantType
+# from the initial value before the real value is written.
+_UA_TYPE_ZEROS: Dict[str, Any] = {
+    "Boolean":    False,
+    "SByte":      0,
+    "Byte":       0,
+    "Int16":      0,
+    "UInt16":     0,
+    "Int32":      0,
+    "UInt32":     0,
+    "Int64":      0,
+    "UInt64":     0,
+    "Float":      0.0,
+    "Double":     0.0,
+    "String":     "",
+    "ByteString": b"",
+}
+
 
 def _snmp_value_to_python(raw_value: Any) -> Any:
     """Convert a pysnmp value object to a plain Python value.
@@ -367,12 +386,19 @@ class ConstantConfig:
     updated again.  Useful for metadata such as firmware version, serial number,
     or any other static property of a device.
 
+    If *value* is ``None`` the node is created with a typed zero initial value
+    and immediately stamped with ``BadWaitingForInitialData``.  This is useful
+    for derived variables that are computed from polled data (e.g. a MAC address
+    assembled from two raw OIDs) -- they can be declared alongside true constants
+    in the config while still indicating to OPC UA clients that no value is
+    available until the first poll completes.
+
     Both *value* and *description* support ``{instance}`` substitution when the
     parent device config uses a multi-IP array (see _expand_multi_ip).
     """
     opcua_name: str           # variable name on the OPC UA side
     opcua_type: str           # one of the keys in _UA_TYPE_MAP
-    value: Any                # the constant value to write (must be castable to opcua_type)
+    value: Any                # the constant value, or None for BadWaitingForInitialData
     description: str = ""
 
     def __post_init__(self):
@@ -578,18 +604,30 @@ class SNMPPoller:
 
         # ── constants ─────────────────────────────────────────────────────────
         for const_cfg in self.constants:
-            variant = _cast_to_ua(const_cfg.value, const_cfg.opcua_type)
-            if isinstance(variant, ua.DataValue):
-                raise ValueError(
-                    f"Constant {const_cfg.opcua_name!r} in poller "
-                    f"{self.opcua_path!r}: value {const_cfg.value!r} "
-                    f"cannot be cast to {const_cfg.opcua_type}"
+            if const_cfg.value is None:
+                # None means "derived / not yet available" -- create a typed
+                # zero placeholder and stamp BadWaitingForInitialData, exactly
+                # like polled variables on startup.
+                _zero = _UA_TYPE_ZEROS.get(const_cfg.opcua_type, "")
+                specs[const_cfg.opcua_name] = NodeSpec(
+                    opcua_type=const_cfg.opcua_type,
+                    initial_value=_zero,
+                    description=const_cfg.description,
+                    initial_status=ua.StatusCode(ua.StatusCodes.BadWaitingForInitialData),
                 )
-            specs[const_cfg.opcua_name] = NodeSpec(
-                opcua_type=const_cfg.opcua_type,
-                initial_value=const_cfg.value,
-                description=const_cfg.description,
-            )
+            else:
+                variant = _cast_to_ua(const_cfg.value, const_cfg.opcua_type)
+                if isinstance(variant, ua.DataValue):
+                    raise ValueError(
+                        f"Constant {const_cfg.opcua_name!r} in poller "
+                        f"{self.opcua_path!r}: value {const_cfg.value!r} "
+                        f"cannot be cast to {const_cfg.opcua_type}"
+                    )
+                specs[const_cfg.opcua_name] = NodeSpec(
+                    opcua_type=const_cfg.opcua_type,
+                    initial_value=const_cfg.value,
+                    description=const_cfg.description,
+                )
 
         return specs
 
