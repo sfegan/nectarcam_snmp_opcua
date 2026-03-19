@@ -17,7 +17,7 @@
             "opcua_name":  "sysUpTime",
             "opcua_type":  "UInt32",
             "description": "System uptime (hundredths of a second)",
-            "maximum_lifetime": 60
+            "lifetime":    60
         },
         {
             "oid":         "SNMPv2-MIB::sysName.0",

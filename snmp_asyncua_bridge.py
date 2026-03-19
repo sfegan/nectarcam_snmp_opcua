@@ -24,7 +24,7 @@ Each SNMPPoller is built from a dict like:
         "description": "Main distribution switch, rack A",  # optional, defaults to ""
         "opcua_path":  "Switch01",      # relative to --opcua-root (or Objects/ if root is empty)
         "poll_interval": 10,            # optional, defaults to 10 (seconds)
-        "default_maximum_lifetime": 30, # optional; per-OID default for lifetime (0 = never expire)
+        "default_lifetime": 30, # optional; per-OID default for lifetime (0 = never expire)
         "oids": [
             {
                 "oid":         "1.3.6.1.2.1.1.1.0",   # sysDescr  (dotted-decimal)
@@ -388,7 +388,7 @@ class OIDConfig:
                               # "local" — polled and stored but not published to OPC UA.
     opcua_type: str           # one of the keys in _UA_TYPE_MAP
     description: str = ""
-    maximum_lifetime: float = -1.0  # seconds; <0 means "use device default"; 0 means never expire
+    lifetime: float = -1.0  # seconds; <0 means "use device default"; 0 means never expire
 
     @property
     def is_local(self) -> bool:
@@ -427,7 +427,7 @@ class ConstantConfig:
     Both *value* and *description* support ``{instance}`` substitution when the
     parent device config uses a multi-IP array (see _expand_multi_ip).
 
-    The *maximum_lifetime* is stored in the data store entry and is available to
+    The *lifetime* is stored in the data store entry and is available to
     subclasses.  The base class does not enforce it for constants (since they are
     not updated by polling), but derived classes may use it for computed/derived
     constant-like variables.  0 means never expire; the default of 0 means
@@ -437,7 +437,7 @@ class ConstantConfig:
     opcua_type: str           # one of the keys in _UA_TYPE_MAP
     value: Any                # the constant value, or None for BadWaitingForInitialData
     description: str = ""
-    maximum_lifetime: float = 0.0  # seconds; 0 = never expire (not enforced by base class)
+    lifetime: float = 0.0  # seconds; 0 = never expire (not enforced by base class)
 
     def __post_init__(self):
         if self.opcua_type not in _UA_TYPE_MAP:
@@ -489,7 +489,7 @@ class StoreEntry:
     timestamp       Wall-clock time (time.monotonic()) when the value was last
                     successfully read from the SNMP device.  None until the first
                     successful read.
-    maximum_lifetime  Seconds before an unread variable is considered expired
+    lifetime  Seconds before an unread variable is considered expired
                     (0 = never expire).  Copied from OIDConfig / ConstantConfig.
     opcua_type      OPC UA type name string (key into _UA_TYPE_MAP).  Kept here
                     so write_variables can inspect the type if needed.
@@ -498,7 +498,7 @@ class StoreEntry:
     """
     data_value:       ua.DataValue
     timestamp:        Optional[float]   # time.monotonic(), or None if never read
-    maximum_lifetime: float             # seconds; 0 = never expire
+    lifetime: float             # seconds; 0 = never expire
     opcua_type:       str
     is_local:         bool = False
 
@@ -530,7 +530,7 @@ class SNMPPoller:
     Each entry tracks:
       • ``data_value``       – current ua.DataValue (value + status)
       • ``timestamp``        – monotonic time of last successful SNMP read
-      • ``maximum_lifetime`` – expiry window in seconds (0 = never)
+      • ``lifetime`` – expiry window in seconds (0 = never)
       • ``opcua_type``       – OPC UA type name string
       • ``is_local``         – True for underscore-prefixed OID variables
 
@@ -540,7 +540,7 @@ class SNMPPoller:
       • Never successfully read: left as BadWaitingForInitialData, not touched.
       • Has a prior value, within lifetime (or lifetime == 0):
             status → UncertainLastUsableValue, value preserved.
-      • Has a prior value, lifetime expired (maximum_lifetime > 0):
+      • Has a prior value, lifetime expired (lifetime > 0):
             status → BadNoCommunication, value → typed zero for the OPC UA type.
       • BadNotSupported: permanent, never overwritten by staleness logic.
 
@@ -567,8 +567,8 @@ class SNMPPoller:
     oids: List[OIDConfig]
     constants: List[ConstantConfig] = field(default_factory=list)
     # Default maximum lifetime (seconds) for OID variables that do not specify
-    # their own.  0 means variables with maximum_lifetime=-1 never expire.
-    default_maximum_lifetime: float = 0.0
+    # their own.  0 means variables with lifetime=-1 never expire.
+    default_lifetime: float = 0.0
 
     # ── runtime state (set by OPCUAServer during registration) ───────────────
     _node_map: Dict[str, Any] = field(default_factory=dict, init=False, repr=False)
@@ -668,7 +668,7 @@ class SNMPPoller:
             poll_interval=float(cfg.get("poll_interval", 10)),
             oids=oids,
             constants=constants,
-            default_maximum_lifetime=float(cfg.get("default_maximum_lifetime", 0.0)),
+            default_lifetime=float(cfg.get("default_lifetime", 0.0)),
         )
 
     # ── subclassing hooks ─────────────────────────────────────────────────────
@@ -883,7 +883,7 @@ class SNMPPoller:
             self._store[name] = StoreEntry(
                 data_value=ua.DataValue(ua.Variant(cast_fn(value), variant_type)),
                 timestamp=time.monotonic(),
-                maximum_lifetime=0.0,
+                lifetime=0.0,
                 opcua_type=opcua_type,
                 is_local=False,
             )
@@ -893,31 +893,31 @@ class SNMPPoller:
         self._store["polling_timestamp"] = StoreEntry(
             data_value=_make_status_dv("DateTime", _waiting),
             timestamp=None,
-            maximum_lifetime=0.0,
+            lifetime=0.0,
             opcua_type="DateTime",
             is_local=False,
         )
         self._store["polling_age"] = StoreEntry(
             data_value=_make_status_dv("Double", _waiting),
             timestamp=None,
-            maximum_lifetime=0.0,
+            lifetime=0.0,
             opcua_type="Double",
             is_local=False,
         )
 
         # ── OID variables (local and published) ───────────────────────────────
         for oid_cfg in self.oids:
-            # Resolve effective maximum_lifetime: if the OID specifies -1, fall
+            # Resolve effective lifetime: if the OID specifies -1, fall
             # back to the device-level default.
-            if oid_cfg.maximum_lifetime < 0:
-                effective_lifetime = self.default_maximum_lifetime
+            if oid_cfg.lifetime < 0:
+                effective_lifetime = self.default_lifetime
             else:
-                effective_lifetime = oid_cfg.maximum_lifetime
+                effective_lifetime = oid_cfg.lifetime
 
             self._store[oid_cfg.opcua_name] = StoreEntry(
                 data_value=_make_status_dv(oid_cfg.opcua_type, _waiting),
                 timestamp=None,
-                maximum_lifetime=effective_lifetime,
+                lifetime=effective_lifetime,
                 opcua_type=oid_cfg.opcua_type,
                 is_local=oid_cfg.is_local,
             )
@@ -935,7 +935,7 @@ class SNMPPoller:
             self._store[const_cfg.opcua_name] = StoreEntry(
                 data_value=dv,
                 timestamp=time.monotonic() if const_cfg.value is not None else None,
-                maximum_lifetime=const_cfg.maximum_lifetime,
+                lifetime=const_cfg.lifetime,
                 opcua_type=const_cfg.opcua_type,
                 is_local=False,
             )
@@ -1086,7 +1086,7 @@ class SNMPPoller:
     def _apply_staleness(self, now: float, oids: Optional[List[OIDConfig]] = None) -> None:
         """
         Update the status of OID store entries that were not refreshed this
-        cycle, according to each entry's timestamp and maximum_lifetime.
+        cycle, according to each entry's timestamp and lifetime.
 
         Rules
         -----
@@ -1117,7 +1117,7 @@ class SNMPPoller:
                 continue
 
             # Has a prior good value — check lifetime
-            ml = entry.maximum_lifetime
+            ml = entry.lifetime
             elapsed = now - entry.timestamp
 
             if ml > 0 and elapsed > ml:
