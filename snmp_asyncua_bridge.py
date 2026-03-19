@@ -191,17 +191,23 @@ _UA_TYPE_MAP: Dict[str, tuple[ua.VariantType, Any]] = {
 
 
 def _snmp_value_to_python(raw_value: Any) -> Any:
-    """Convert a pysnmp value object to a plain Python value."""
+    """Convert a pysnmp value object to a plain Python value.
+
+    OctetString is always returned as raw bytes rather than via prettyPrint().
+    prettyPrint() is unreliable for binary data: it returns a lossy ASCII
+    string for printable bytes, or a '0x...' hex string for non-ASCII bytes
+    (the exact form depends on the pysnmp version and whether lookupMib is
+    enabled).  Returning bytes lets _cast_to_ua() apply the correct conversion
+    to whichever OPC UA type the configuration declares (String, ByteString,
+    etc.), and keeps the behaviour consistent regardless of MIB availability.
+    """
     if isinstance(raw_value, (Integer, Integer32, TimeTicks,
                                Counter32, Counter64, Gauge32, Unsigned32)):
         return int(raw_value)
     if isinstance(raw_value, IpAddress):
         return str(raw_value)
     if isinstance(raw_value, OctetString):
-        try:
-            return raw_value.prettyPrint()          # human-readable if ASCII
-        except Exception:
-            return bytes(raw_value)
+        return bytes(raw_value)
     return raw_value.prettyPrint()
 
 
@@ -213,9 +219,19 @@ def _cast_to_ua(value: Any, opcua_type: str) -> ua.DataValue | ua.Variant:
     with status BadDataEncodingInvalid so OPC UA clients see a proper error
     status rather than a silently mis-typed String value written to a node
     that was declared with a different type.
+
+    Special case: when the target type is String and the value is bytes
+    (as returned by _snmp_value_to_python for OctetString), the bytes are
+    decoded to a Python str using UTF-8 with a latin-1 fallback rather than
+    calling str() which would produce the Python repr "b'...'".
     """
     variant_type, cast_fn = _UA_TYPE_MAP[opcua_type]
     try:
+        if opcua_type == "String" and isinstance(value, (bytes, bytearray)):
+            try:
+                value = value.decode("utf-8")
+            except UnicodeDecodeError:
+                value = value.decode("latin-1")
         return ua.Variant(cast_fn(value), variant_type)
     except (ValueError, TypeError) as exc:
         log.warning("Type cast failed (%s → %s): %s – writing BadDataEncodingInvalid",
