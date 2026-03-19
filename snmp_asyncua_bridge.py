@@ -24,6 +24,7 @@ Each SNMPPoller is built from a dict like:
         "description": "Main distribution switch, rack A",  # optional, defaults to ""
         "opcua_path":  "Switch01",      # relative to --opcua-root (or Objects/ if root is empty)
         "poll_interval": 10,            # optional, defaults to 10 (seconds)
+        "default_maximum_lifetime": 30, # optional; per-OID default for lifetime (0 = never expire)
         "oids": [
             {
                 "oid":         "1.3.6.1.2.1.1.1.0",   # sysDescr  (dotted-decimal)
@@ -63,7 +64,7 @@ directly under the server's Objects/ node with no intermediate container.
 Supported opcua_type values
 ---------------------------
   Boolean, SByte, Byte, Int16, UInt16, Int32, UInt32,
-  Int64, UInt64, Float, Double, String, ByteString
+  Int64, UInt64, Float, Double, String, ByteString, DateTime
 
 Multiple identical devices (ip array)
 --------------------------------------
@@ -93,11 +94,13 @@ from __future__ import annotations
 
 import argparse
 import asyncio
+import datetime
 import json
 import logging
 import logging.handlers
 import re
 import sys
+import time
 from dataclasses import dataclass, field
 from typing import Any, Dict, List, Optional
 
@@ -187,6 +190,7 @@ _UA_TYPE_MAP: Dict[str, tuple[ua.VariantType, Any]] = {
     "Double":     (ua.VariantType.Double,     float),
     "String":     (ua.VariantType.String,     str),
     "ByteString": (ua.VariantType.ByteString, bytes),
+    "DateTime":   (ua.VariantType.DateTime,   None),  # cast_fn unused; values are datetime objects
 }
 
 # Typed zero values for each OPC UA type -- used when a constant is declared
@@ -206,7 +210,26 @@ _UA_TYPE_ZEROS: Dict[str, Any] = {
     "Double":     0.0,
     "String":     "",
     "ByteString": b"",
+    "DateTime":   datetime.datetime.fromtimestamp(0, tz=datetime.timezone.utc),
 }
+
+
+def _make_status_dv(opcua_type: str, status: ua.StatusCode) -> ua.DataValue:
+    """
+    Build a ua.DataValue carrying *status* and a typed zero value for *opcua_type*.
+
+    asyncua rejects writing a DataValue whose Variant type is Null to a node
+    that was created with a concrete type, even when the intent is only to
+    communicate a bad/uncertain status.  Always pairing the status code with a
+    correctly-typed (zero) value avoids the BadTypeMismatch error while still
+    letting OPC UA clients see the status code.
+    """
+    variant_type = _UA_TYPE_MAP[opcua_type][0]
+    zero = _UA_TYPE_ZEROS.get(opcua_type, "")
+    return ua.DataValue(
+        Value=ua.Variant(zero, variant_type),
+        StatusCode_=status,
+    )
 
 
 def _snmp_value_to_python(raw_value: Any) -> Any:
@@ -255,9 +278,10 @@ def _cast_to_ua(value: Any, opcua_type: str) -> ua.DataValue | ua.Variant:
     except (ValueError, TypeError) as exc:
         log.warning("Type cast failed (%s → %s): %s – writing BadDataEncodingInvalid",
                     value, opcua_type, exc)
+        zero = _UA_TYPE_ZEROS.get(opcua_type, "")
         return ua.DataValue(
-            ua.Variant(None, ua.VariantType.Null),
-            ua.StatusCode(ua.StatusCodes.BadDataEncodingInvalid),
+            Value=ua.Variant(zero, variant_type),
+            StatusCode_=ua.StatusCode(ua.StatusCodes.BadDataEncodingInvalid),
         )
 
 
@@ -360,9 +384,16 @@ class OIDConfig:
     oid: str                  # dotted-decimal or symbolic, e.g. "SNMPv2-MIB::sysName.0"
                               # Symbolic names are resolved to dotted-decimal in __post_init__
                               # so the poll loop and OID-key resolver always see numeric OIDs.
-    opcua_name: str           # variable name on OPC UA side
+    opcua_name: str           # variable name on OPC UA side; names beginning with "_" are
+                              # "local" — polled and stored but not published to OPC UA.
     opcua_type: str           # one of the keys in _UA_TYPE_MAP
     description: str = ""
+    maximum_lifetime: float = -1.0  # seconds; <0 means "use device default"; 0 means never expire
+
+    @property
+    def is_local(self) -> bool:
+        """True when this OID should not be published to OPC UA (name starts with '_')."""
+        return self.opcua_name.startswith("_")
 
     def __post_init__(self):
         if self.opcua_type not in _UA_TYPE_MAP:
@@ -395,11 +426,18 @@ class ConstantConfig:
 
     Both *value* and *description* support ``{instance}`` substitution when the
     parent device config uses a multi-IP array (see _expand_multi_ip).
+
+    The *maximum_lifetime* is stored in the data store entry and is available to
+    subclasses.  The base class does not enforce it for constants (since they are
+    not updated by polling), but derived classes may use it for computed/derived
+    constant-like variables.  0 means never expire; the default of 0 means
+    constants are always considered valid unless a subclass acts on the lifetime.
     """
     opcua_name: str           # variable name on the OPC UA side
     opcua_type: str           # one of the keys in _UA_TYPE_MAP
     value: Any                # the constant value, or None for BadWaitingForInitialData
     description: str = ""
+    maximum_lifetime: float = 0.0  # seconds; 0 = never expire (not enforced by base class)
 
     def __post_init__(self):
         if self.opcua_type not in _UA_TYPE_MAP:
@@ -440,28 +478,83 @@ class NodeSpec:
 
 
 @dataclass
+class StoreEntry:
+    """
+    A single entry in the SNMPPoller internal data store.
+
+    Fields
+    ------
+    data_value      The current ua.DataValue (value + status code).  The Value
+                    field may be None when the status is bad (e.g. BadNoCommunication).
+    timestamp       Wall-clock time (time.monotonic()) when the value was last
+                    successfully read from the SNMP device.  None until the first
+                    successful read.
+    maximum_lifetime  Seconds before an unread variable is considered expired
+                    (0 = never expire).  Copied from OIDConfig / ConstantConfig.
+    opcua_type      OPC UA type name string (key into _UA_TYPE_MAP).  Kept here
+                    so write_variables can inspect the type if needed.
+    is_local        True for OID variables whose opcua_name starts with '_'.
+                    These are stored but no OPC UA node is created for them.
+    """
+    data_value:       ua.DataValue
+    timestamp:        Optional[float]   # time.monotonic(), or None if never read
+    maximum_lifetime: float             # seconds; 0 = never expire
+    opcua_type:       str
+    is_local:         bool = False
+
+
+@dataclass
 class SNMPPoller:
     """
     Polls a single SNMP device (SNMPv2c) and writes values to OPC UA nodes.
 
-    Automatically adds three built-in variables to the OPC UA object:
-      • host       (String)  – IP address of the device
-      • port       (UInt16)  – UDP port of the SNMP agent
-      • cls_state  (Byte)    – 0 = offline, 1 = online
+    Automatically adds six built-in variables to the OPC UA object:
+      • host               (String)    – IP address of the device
+      • port               (UInt16)    – UDP port of the SNMP agent
+      • cls_state          (Byte)      – 0 = offline, 1 = online
+      • polling_timestamp  (DateTime)  – wall-clock time of the last successful poll
+      • polling_age        (Double)    – seconds since the last successful poll (always Good)
+      • polling_interval   (Double)    – configured poll interval in seconds
 
-    Optional constants (see ConstantConfig) are created alongside polled
-    variables and included in _node_map so they can be updated via
-    write_variables() like any other node.
+    OID variables whose ``opcua_name`` begins with ``"_"`` are *local*: they are
+    polled from SNMP and stored in the internal data store but no OPC UA node is
+    created for them.  Subclasses can read them from ``self._store`` to compute
+    derived variables.
+
+    Internal data store (``self._store``)
+    -------------------------------------
+    A dict mapping ``opcua_name`` → ``StoreEntry`` for every variable managed by
+    this poller: OID variables (local and published), constants, and server
+    variables (host, port, cls_state, polling_timestamp, polling_interval).
+
+    Each entry tracks:
+      • ``data_value``       – current ua.DataValue (value + status)
+      • ``timestamp``        – monotonic time of last successful SNMP read
+      • ``maximum_lifetime`` – expiry window in seconds (0 = never)
+      • ``opcua_type``       – OPC UA type name string
+      • ``is_local``         – True for underscore-prefixed OID variables
+
+    Lifetime / staleness management (handled in poll_once)
+    -------------------------------------------------------
+    When a variable is not updated in a poll cycle (e.g. the device is offline):
+      • Never successfully read: left as BadWaitingForInitialData, not touched.
+      • Has a prior value, within lifetime (or lifetime == 0):
+            status → UncertainLastUsableValue, value preserved.
+      • Has a prior value, lifetime expired (maximum_lifetime > 0):
+            status → BadNoCommunication, value → typed zero for the OPC UA type.
+      • BadNotSupported: permanent, never overwritten by staleness logic.
 
     Subclassing hooks
     -----------------
-    build_variable_specs()  Override to add, remove, or modify the NodeSpec
-                            dict before nodes are created.
-    create_variables()      Override to customise how nodes are actually
-                            created (e.g. add nodes outside the spec dict).
-    write_variables()       Override to intercept, modify, or suppress writes
-                            to OPC UA on every poll cycle.
-    on_address_space_ready() Called once after all nodes have been created.
+    build_variable_specs()    Override to add, remove, or modify the NodeSpec
+                              dict before nodes are created.
+    create_variables()        Override to customise how nodes are actually
+                              created (e.g. add nodes outside the spec dict).
+    write_variables()         Override to intercept writes.  The override can
+                              inspect and mutate ``self._store`` entries before
+                              calling ``super().write_variables()``, which writes
+                              every non-local store entry to its OPC UA node.
+    on_address_space_ready()  Called once after all nodes have been created.
     """
 
     # ── config ────────────────────────────────────────────────────────────────
@@ -473,9 +566,16 @@ class SNMPPoller:
     poll_interval: float      # seconds
     oids: List[OIDConfig]
     constants: List[ConstantConfig] = field(default_factory=list)
+    # Default maximum lifetime (seconds) for OID variables that do not specify
+    # their own.  0 means variables with maximum_lifetime=-1 never expire.
+    default_maximum_lifetime: float = 0.0
 
     # ── runtime state (set by OPCUAServer during registration) ───────────────
     _node_map: Dict[str, Any] = field(default_factory=dict, init=False, repr=False)
+    # Internal data store: opcua_name → StoreEntry for ALL variables managed by
+    # this poller (OIDs, constants, server variables).  Populated in
+    # _init_store() which is called from on_address_space_ready().
+    _store: Dict[str, "StoreEntry"] = field(default_factory=dict, init=False, repr=False)
     # The asyncua Object node for this device — available to subclasses from
     # on_address_space_ready() onwards.
     _device_node: Any = field(default=None, init=False, repr=False)
@@ -506,17 +606,31 @@ class SNMPPoller:
         # and leaks resources even when close_dispatcher() is called.
         self._snmp_engine = SnmpEngine()
 
+        # Names reserved for built-in server variables — cannot be used as OID
+        # or constant names because they would silently overwrite each other's
+        # OPC UA node in _node_map and their store entries.
+        _RESERVED = {"host", "port", "cls_state", "polling_timestamp", "polling_age", "polling_interval"}
+
         # Detect duplicate opcua_name values within this poller's OID list and
-        # constants.  Duplicates across either list would silently overwrite
-        # each other's OPC UA node.
+        # constants, and guard against collisions with reserved names.
         seen: set[str] = set()
         for o in self.oids:
+            if o.opcua_name in _RESERVED:
+                raise ValueError(
+                    f"OID opcua_name {o.opcua_name!r} in poller {self.opcua_path!r} "
+                    f"conflicts with a reserved server variable name: {sorted(_RESERVED)}"
+                )
             if o.opcua_name in seen:
                 raise ValueError(
                     f"Duplicate opcua_name {o.opcua_name!r} in poller {self.opcua_path!r}"
                 )
             seen.add(o.opcua_name)
         for c in self.constants:
+            if c.opcua_name in _RESERVED:
+                raise ValueError(
+                    f"Constant opcua_name {c.opcua_name!r} in poller {self.opcua_path!r} "
+                    f"conflicts with a reserved server variable name: {sorted(_RESERVED)}"
+                )
             if c.opcua_name in seen:
                 raise ValueError(
                     f"Duplicate opcua_name {c.opcua_name!r} in poller {self.opcua_path!r} "
@@ -554,6 +668,7 @@ class SNMPPoller:
             poll_interval=float(cfg.get("poll_interval", 10)),
             oids=oids,
             constants=constants,
+            default_maximum_lifetime=float(cfg.get("default_maximum_lifetime", 0.0)),
         )
 
     # ── subclassing hooks ─────────────────────────────────────────────────────
@@ -563,7 +678,9 @@ class SNMPPoller:
         Build and return the complete dict of NodeSpecs for this poller.
 
         Keys are opcua_name strings.  The dict is ordered: built-ins first
-        (host, port, cls_state), then OID variables, then constants.
+        (host, port, cls_state, polling_timestamp, polling_age, polling_interval),
+        then published OID variables (local/underscore-prefixed OIDs are omitted —
+        they have no OPC UA node), then constants.
 
         Override to add, remove, or modify specs before node creation.
         Entries added here with names that also appear in _node_map will be
@@ -571,7 +688,7 @@ class SNMPPoller:
         """
         specs: Dict[str, NodeSpec] = {}
 
-        # ── built-in metadata variables ───────────────────────────────────────
+        # ── built-in server metadata variables ───────────────────────────────
         specs["host"] = NodeSpec(
             opcua_type="String",
             initial_value=self.ip,
@@ -587,14 +704,31 @@ class SNMPPoller:
             initial_value=0,
             description="Device state: 0 = offline, 1 = online",
         )
+        specs["polling_timestamp"] = NodeSpec(
+            opcua_type="DateTime",
+            initial_value=datetime.datetime.fromtimestamp(0, tz=datetime.timezone.utc),
+            description="Wall-clock time of the last successful poll",
+            initial_status=ua.StatusCode(ua.StatusCodes.BadWaitingForInitialData),
+        )
+        specs["polling_age"] = NodeSpec(
+            opcua_type="Double",
+            initial_value=0.0,
+            description="Seconds since the last successful poll (always Good status)",
+            initial_status=ua.StatusCode(ua.StatusCodes.BadWaitingForInitialData),
+        )
+        specs["polling_interval"] = NodeSpec(
+            opcua_type="Double",
+            initial_value=self.poll_interval,
+            description="Configured poll interval in seconds",
+        )
 
-        # ── SNMP-polled OID variables ─────────────────────────────────────────
+        # ── SNMP-polled OID variables (published only — skip local ones) ─────
+        # Local (underscore-prefixed) OIDs are still polled from the device and
+        # held in the data store, but no OPC UA node is created for them.
         for oid_cfg in self.oids:
-            _variant_type, cast_fn = _UA_TYPE_MAP[oid_cfg.opcua_type]
-            try:
-                zero = cast_fn(0)
-            except (ValueError, TypeError):
-                zero = cast_fn()    # e.g. str(), bytes()
+            if oid_cfg.is_local:
+                continue
+            zero = _UA_TYPE_ZEROS.get(oid_cfg.opcua_type, "")
             specs[oid_cfg.opcua_name] = NodeSpec(
                 opcua_type=oid_cfg.opcua_type,
                 initial_value=zero,
@@ -656,7 +790,10 @@ class SNMPPoller:
             await var_node.set_writable(False)
             if spec.initial_status is not None:
                 await var_node.write_value(
-                    ua.DataValue(StatusCode_=spec.initial_status)
+                    ua.DataValue(
+                        Value=ua.Variant(spec.initial_value, variant_type),
+                        StatusCode_=spec.initial_status,
+                    )
                 )
             if spec.description:
                 await var_node.write_attribute(
@@ -672,34 +809,41 @@ class SNMPPoller:
             log.debug("  OPC UA variable: %s.%s (%s)  node_id=%s",
                       self.opcua_path, opcua_name, spec.opcua_type, var_node.nodeid)
 
-    async def write_variables(self, values: Dict[str, ua.DataValue]) -> None:
+    async def write_variables(self) -> None:
         """
-        Write a batch of OPC UA values to their nodes.
+        Write every non-local store entry to its OPC UA node.
 
-        *values* maps opcua_name → ua.DataValue.  Only names present in
-        _node_map are written; unknown names are silently ignored, so subclasses
-        can safely pass extra entries without causing errors.
+        Iterates ``self._store`` and writes every entry that has a node in
+        ``_node_map``.  Local OID entries (``is_local=True``) and entries with
+        no corresponding node are silently skipped.
 
-        Override to intercept all writes — good values, stale markers, bad
-        status codes — on every poll cycle.  Modify, suppress, or augment
-        entries, then call super() to perform the actual writes.
+        Override to intercept or modify store entries before writing.  Your
+        override can inspect and mutate ``self._store`` (e.g. to compute a
+        derived variable and add/update an entry), then call
+        ``await super().write_variables()`` to perform the actual writes.
 
-        Example — derive a computed variable and suppress a raw OID write::
+        Example — derive a computed variable from a local raw OID::
 
-            async def write_variables(self, values):
-                raw = values.pop("rawPower", None)
-                if raw is not None and raw.Value is not None:
-                    computed = ua.Variant(raw.Value.Value * 1000, ua.VariantType.Float)
-                    values["PowerMilliWatts"] = ua.DataValue(computed)
-                await super().write_variables(values)
+            async def write_variables(self):
+                raw_entry = self._store.get("_rawPower")
+                if raw_entry and raw_entry.data_value.Value is not None:
+                    watts = raw_entry.data_value.Value.Value * 1000
+                    entry = self._store.get("PowerMilliWatts")
+                    if entry:
+                        entry.data_value = ua.DataValue(
+                            ua.Variant(float(watts), ua.VariantType.Double)
+                        )
+                await super().write_variables()
         """
-        for opcua_name, data_value in values.items():
+        for opcua_name, entry in self._store.items():
+            if entry.is_local:
+                continue
             node = self._node_map.get(opcua_name)
             if node is None:
                 continue
-            log.debug("  Writing %s.%s = %s", self.opcua_path, opcua_name, data_value)
+            log.debug("  Writing %s.%s = %s", self.opcua_path, opcua_name, entry.data_value)
             try:
-                await node.write_value(data_value)
+                await node.write_value(entry.data_value)
             except Exception as exc:
                 log.error("OPC UA write failed for %s.%s: %s",
                           self.opcua_path, opcua_name, exc)
@@ -709,9 +853,92 @@ class SNMPPoller:
         Called once after all OPC UA nodes have been created for this poller.
 
         self._device_node and self._node_map are fully populated at this point.
+        The default implementation initialises the internal data store.
         Override to perform any one-time setup that requires access to the
-        node tree — e.g. reading existing values or creating subscriptions.
+        node tree — but always call ``await super().on_address_space_ready()``
+        first so the data store is ready before your code runs.
         """
+        self._init_store()
+
+    def _init_store(self) -> None:
+        """
+        Populate ``self._store`` with a StoreEntry for every variable managed
+        by this poller: server variables, published OID variables, local OID
+        variables, and constants.
+
+        Called once from on_address_space_ready().  Subclasses that add extra
+        OPC UA nodes in create_variables() should add corresponding StoreEntry
+        objects here (override _init_store or add entries after calling super).
+        """
+        _waiting = ua.StatusCode(ua.StatusCodes.BadWaitingForInitialData)
+
+        # ── server variables ──────────────────────────────────────────────────
+        for name, opcua_type, value in [
+            ("host",              "String",   self.ip),
+            ("port",              "UInt16",   self.port),
+            ("cls_state",         "Byte",     0),
+            ("polling_interval",  "Double",   self.poll_interval),
+        ]:
+            variant_type, cast_fn = _UA_TYPE_MAP[opcua_type]
+            self._store[name] = StoreEntry(
+                data_value=ua.DataValue(ua.Variant(cast_fn(value), variant_type)),
+                timestamp=time.monotonic(),
+                maximum_lifetime=0.0,
+                opcua_type=opcua_type,
+                is_local=False,
+            )
+
+        # polling_timestamp and polling_age start as BadWaitingForInitialData;
+        # both are updated only on a successful SNMP poll.
+        self._store["polling_timestamp"] = StoreEntry(
+            data_value=_make_status_dv("DateTime", _waiting),
+            timestamp=None,
+            maximum_lifetime=0.0,
+            opcua_type="DateTime",
+            is_local=False,
+        )
+        self._store["polling_age"] = StoreEntry(
+            data_value=_make_status_dv("Double", _waiting),
+            timestamp=None,
+            maximum_lifetime=0.0,
+            opcua_type="Double",
+            is_local=False,
+        )
+
+        # ── OID variables (local and published) ───────────────────────────────
+        for oid_cfg in self.oids:
+            # Resolve effective maximum_lifetime: if the OID specifies -1, fall
+            # back to the device-level default.
+            if oid_cfg.maximum_lifetime < 0:
+                effective_lifetime = self.default_maximum_lifetime
+            else:
+                effective_lifetime = oid_cfg.maximum_lifetime
+
+            self._store[oid_cfg.opcua_name] = StoreEntry(
+                data_value=_make_status_dv(oid_cfg.opcua_type, _waiting),
+                timestamp=None,
+                maximum_lifetime=effective_lifetime,
+                opcua_type=oid_cfg.opcua_type,
+                is_local=oid_cfg.is_local,
+            )
+
+        # ── constants ─────────────────────────────────────────────────────────
+        for const_cfg in self.constants:
+            if const_cfg.value is None:
+                dv = _make_status_dv(const_cfg.opcua_type, _waiting)
+            else:
+                variant = _cast_to_ua(const_cfg.value, const_cfg.opcua_type)
+                if isinstance(variant, ua.DataValue):
+                    dv = variant   # cast failed — already a bad-status DataValue
+                else:
+                    dv = ua.DataValue(variant)
+            self._store[const_cfg.opcua_name] = StoreEntry(
+                data_value=dv,
+                timestamp=time.monotonic() if const_cfg.value is not None else None,
+                maximum_lifetime=const_cfg.maximum_lifetime,
+                opcua_type=const_cfg.opcua_type,
+                is_local=False,
+            )
 
     # ── SNMP helpers ──────────────────────────────────────────────────────────
 
@@ -808,17 +1035,12 @@ class SNMPPoller:
                  self.ip, self.opcua_path, self.poll_interval)
 
         loop = asyncio.get_running_loop()
-        origin = loop.time()          # phase reference: time of first poll
+        origin = loop.time()
         cycle = 0
 
         while True:
             log.debug("Poller %s: starting cycle %d", self.ip, cycle + 1)
-            online = await self._poll_once()
-            await self.write_variables({
-                "cls_state": ua.DataValue(
-                    ua.Variant(1 if online else 0, ua.VariantType.Byte)
-                )
-            })
+            await self._poll_once()
 
             cycle += 1
             next_deadline = origin + cycle * self.poll_interval
@@ -828,9 +1050,12 @@ class SNMPPoller:
                           self.ip, cycle, sleep_for)
                 await asyncio.sleep(sleep_for)
             else:
-                # Poll overran its slot — log and continue immediately
-                log.warning("Poller %s overran slot by %.3fs (cycle %d)",
-                            self.ip, -sleep_for, cycle)
+                if not self._was_offline:
+                    log.warning("Poller %s overran slot by %.3fs (cycle %d)",
+                                self.ip, -sleep_for, cycle)
+                else:
+                    log.debug("Poller %s overran slot by %.3fs (cycle %d, device offline)",
+                              self.ip, -sleep_for, cycle)
 
     def _resolve_oid_key(self, oid_cfg: OIDConfig, results: Dict[str, Any]) -> Optional[str]:
         """
@@ -851,9 +1076,6 @@ class SNMPPoller:
             log.debug("  OID key match (suffixed .0): %s → %s", oid_cfg.oid, suffixed)
             return suffixed
         for key in results:
-            # Guard with a dot boundary so that e.g. "1.1.0" does not
-            # accidentally match a key ending in "11.0" (plain string-suffix
-            # would pass but the OIDs are unrelated).
             if key.endswith("." + oid_cfg.oid) or oid_cfg.oid.endswith("." + key):
                 log.debug("  OID key match (suffix boundary): %s → %s", oid_cfg.oid, key)
                 return key
@@ -861,66 +1083,124 @@ class SNMPPoller:
                   oid_cfg.oid, list(results))
         return None
 
-    async def _poll_once(self) -> bool:
+    def _apply_staleness(self, now: float, oids: Optional[List[OIDConfig]] = None) -> None:
         """
-        Fetch all configured OIDs in one bulk GET, build a values dict of
-        opcua_name → ua.DataValue for every node that needs updating, then
-        hand the whole dict to write_variables() in one call.
+        Update the status of OID store entries that were not refreshed this
+        cycle, according to each entry's timestamp and maximum_lifetime.
 
-        OID key resolution is performed on the first successful poll after the
-        device was offline, then cached for subsequent cycles.  The cache is
+        Rules
+        -----
+        • Entry has never been successfully read (timestamp is None):
+              Leave unchanged — keeps BadWaitingForInitialData.
+        • Entry has a prior value AND lifetime not expired:
+              status → UncertainLastUsableValue, value preserved.
+        • Entry has a prior value AND lifetime expired (ml > 0, elapsed > ml):
+              status → BadNoCommunication, value → None.
+        • BadNotSupported: permanent — never touched by staleness logic.
+        • Any already-bad status with no value: leave unchanged.
+        """
+        _uncertain    = ua.StatusCode(ua.StatusCodes.UncertainLastUsableValue)
+        _bad_no_comm  = ua.StatusCode(ua.StatusCodes.BadNoCommunication)
+        _bad_no_supp  = ua.StatusCode(ua.StatusCodes.BadNotSupported)
+
+        for oid_cfg in (oids if oids is not None else self.oids):
+            entry = self._store.get(oid_cfg.opcua_name)
+            if entry is None:
+                continue
+
+            # Permanent bad status — never overwrite
+            if entry.data_value.StatusCode == _bad_no_supp:
+                continue
+
+            # Never successfully read — leave as BadWaitingForInitialData
+            if entry.timestamp is None:
+                continue
+
+            # Has a prior good value — check lifetime
+            ml = entry.maximum_lifetime
+            elapsed = now - entry.timestamp
+
+            if ml > 0 and elapsed > ml:
+                # Lifetime expired — write typed zero with bad status
+                if entry.data_value.StatusCode != _bad_no_comm:
+                    log.debug(
+                        "Lifetime expired for %s.%s (last read %.1fs ago, limit %.1fs)"
+                        " — marking BadNoCommunication",
+                        self.opcua_path, oid_cfg.opcua_name, elapsed, ml,
+                    )
+                entry.data_value = ua.DataValue(
+                    Value=ua.Variant(
+                        _UA_TYPE_ZEROS.get(entry.opcua_type, ""),
+                        _UA_TYPE_MAP[entry.opcua_type][0],
+                    ),
+                    StatusCode_=_bad_no_comm,
+                )
+            else:
+                # Within lifetime (or never-expire) — preserve value, mark uncertain
+                if entry.data_value.StatusCode != _uncertain:
+                    log.debug("Marking %s.%s UncertainLastUsableValue",
+                              self.opcua_path, oid_cfg.opcua_name)
+                entry.data_value = ua.DataValue(
+                    Value=entry.data_value.Value,
+                    StatusCode_=_uncertain,
+                )
+
+    async def _poll_once(self) -> None:
+        """
+        Fetch all configured OIDs in one bulk GET, update the internal data
+        store for every variable, then call write_variables() to push the
+        entire store to OPC UA.
+
+        Responsibilities
+        ----------------
+        • Update polling_timestamp and polling_age only on a successful poll,
+          using the initiation time (captured before the GET) so they reflect
+          when the request was sent rather than when the response arrived.
+        • On a successful response: update store entries for every OID that
+          replied, resolve and cache OID keys on the first post-offline cycle.
+        • On a failed response (device offline): apply staleness / lifetime
+          expiry to all OID store entries via _apply_staleness().
+        • Update cls_state (1 = online, 0 = offline) in the store.
+        • Call write_variables() once at the end of every cycle.
+
+        OID key resolution is cached after the first successful poll and
         cleared when the device goes offline so keys are re-resolved on
         recovery.
-
-        On the offline transition every node whose OID key was successfully
-        resolved is stamped with UncertainLastUsableValue, preserving the last
-        known value while signalling to clients that it is stale.
-
-        Returns True if the device responded (even partially), False if totally
-        unreachable.
         """
+        now = time.monotonic()
+
         results = await self._get_all_oids()
 
         if results is None:
-            # Complete transport failure — device offline
+            # ── Device offline ────────────────────────────────────────────────
             if not self._was_offline:
                 log.warning("Device went offline: %s", self.ip)
-                # Stamp all previously-resolved nodes as stale.
-                # UncertainLastUsableValue is not a bad status code, so asyncua
-                # still enforces the type check on Value — we must read and
-                # reuse each node's current Value, replacing only the status.
-                _uncertain = ua.StatusCode(ua.StatusCodes.UncertainLastUsableValue)
-                values: Dict[str, ua.DataValue] = {}
-                for opcua_name in self._oid_key_cache:
-                    node = self._node_map.get(opcua_name)
-                    if node is not None:
-                        try:
-                            current_dv = await node.read_data_value()
-                            values[opcua_name] = ua.DataValue(
-                                Value=current_dv.Value,
-                                StatusCode_=_uncertain,
-                            )
-                        except Exception as exc:
-                            log.error(
-                                "Failed to read current value for %s.%s "
-                                "during offline transition: %s",
-                                self.opcua_path, opcua_name, exc,
-                            )
-                if values:
-                    await self.write_variables(values)
                 self._oid_key_cache.clear()
                 self._was_offline = True
-            else:
-                log.debug("Device still offline: %s", self.ip)
-            return False
+
+            log.debug("Device offline: %s", self.ip)
+            self._apply_staleness(now)  # processes all self.oids
+
+            self._store["cls_state"].data_value = ua.DataValue(
+                ua.Variant(0, ua.VariantType.Byte)
+            )
+
+            # polling_age keeps ticking even while offline using the initiation
+            # time of this cycle vs the timestamp of the last successful poll.
+            # polling_timestamp is NOT updated — it stays at the last success.
+            last_ts = self._store["polling_timestamp"].timestamp
+            if last_ts is not None:
+                self._store["polling_age"].data_value = ua.DataValue(
+                    ua.Variant(now - last_ts, ua.VariantType.Double)
+                )
+
+            await self.write_variables()
+            return
 
         # ── Device is responding ──────────────────────────────────────────────
         if self._was_offline:
-            # Transition offline → online: resolve and cache OID keys.
-            # Any OID the agent doesn't support gets BadNotSupported immediately.
             log.info("Device came online: %s — resolving OID keys", self.ip)
             self._oid_key_cache.clear()
-            bad_status_values: Dict[str, ua.DataValue] = {}
             for oid_cfg in self.oids:
                 key = self._resolve_oid_key(oid_cfg, results)
                 if key is not None:
@@ -928,48 +1208,74 @@ class SNMPPoller:
                     log.debug("  OID resolved: %s -> %s (%s)",
                               oid_cfg.oid, key, oid_cfg.opcua_name)
                 else:
-                    log.warning("OID not supported by device – marking BadNotSupported: "
-                                "%s on %s", oid_cfg.oid, self.ip)
-                    # BadNotSupported is a bad status code — asyncua bypasses the
-                    # type check and forces Value to null server-side.
-                    bad_status_values[oid_cfg.opcua_name] = ua.DataValue(
-                        StatusCode_=ua.StatusCode(ua.StatusCodes.BadNotSupported)
+                    log.warning(
+                        "OID not supported by device – marking BadNotSupported: "
+                        "%s on %s", oid_cfg.oid, self.ip,
                     )
-            if bad_status_values:
-                await self.write_variables(bad_status_values)
+                    entry = self._store[oid_cfg.opcua_name]
+                    entry.data_value = ua.DataValue(
+                        Value=ua.Variant(
+                            _UA_TYPE_ZEROS.get(entry.opcua_type, ""),
+                            _UA_TYPE_MAP[entry.opcua_type][0],
+                        ),
+                        StatusCode_=ua.StatusCode(ua.StatusCodes.BadNotSupported),
+                    )
             self._was_offline = False
 
-        # ── Build and dispatch the values dict ────────────────────────────────
-        any_ok = False
-        values = {}
+        # ── Update store entries for OIDs present in the response ─────────────
+        responded: set[str] = set()
         for oid_cfg in self.oids:
             key = self._oid_key_cache.get(oid_cfg.opcua_name)
             if key is None:
-                continue    # OID marked BadNotSupported at startup
+                continue    # marked BadNotSupported on coming online
 
             raw = results.get(key)
             if raw is None:
-                # Key resolved correctly at startup but absent in this response.
                 log.warning("Cached OID key no longer in response: %s on %s",
                             key, self.ip)
                 continue
 
-            any_ok = True
             py_val = _snmp_value_to_python(raw)
             variant = _cast_to_ua(py_val, oid_cfg.opcua_type)
-            log.debug("  Queuing %s.%s = %r (raw type: %s)",
+            log.debug("  Read %s.%s = %r (raw type: %s)",
                       self.opcua_path, oid_cfg.opcua_name,
                       py_val, type(raw).__name__)
-            # _cast_to_ua returns ua.Variant on success, ua.DataValue on failure
+
+            entry = self._store[oid_cfg.opcua_name]
             if isinstance(variant, ua.Variant):
-                values[oid_cfg.opcua_name] = ua.DataValue(variant)
+                entry.data_value = ua.DataValue(variant)
             else:
-                values[oid_cfg.opcua_name] = variant   # already a DataValue (bad status)
+                entry.data_value = variant   # already a DataValue (cast failed)
+            entry.timestamp = now
+            responded.add(oid_cfg.opcua_name)
 
-        if values:
-            await self.write_variables(values)
+        # ── Apply staleness to OIDs that did not respond this cycle ───────────
+        missing = [
+            oid_cfg for oid_cfg in self.oids
+            if oid_cfg.opcua_name not in responded
+            and self._oid_key_cache.get(oid_cfg.opcua_name) is not None
+        ]
+        if missing:
+            self._apply_staleness(now, oids=missing)
 
-        return any_ok
+        # ── Update polling_timestamp and polling_age on success ───────────────
+        # Stamped with the initiation time of this cycle (now), so polling_age
+        # resets to ~0.0 on success and polling_timestamp reflects when the
+        # request was sent rather than when the response arrived.
+        wall_now = datetime.datetime.now(datetime.timezone.utc)
+        self._store["polling_timestamp"].data_value = ua.DataValue(
+            ua.Variant(wall_now, ua.VariantType.DateTime)
+        )
+        self._store["polling_timestamp"].timestamp = now
+        self._store["polling_age"].data_value = ua.DataValue(
+            ua.Variant(0.0, ua.VariantType.Double)
+        )
+        self._store["polling_age"].timestamp = now
+
+        self._store["cls_state"].data_value = ua.DataValue(
+            ua.Variant(1, ua.VariantType.Byte)
+        )
+        await self.write_variables()
 
 
 # ─────────────────────────────────────────────────────────────────────────────
