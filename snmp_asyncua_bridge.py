@@ -1080,15 +1080,10 @@ class SNMPPoller:
                     await self._poll_once()
                 poll_ran = True
 
-            # ── Advance past any slots that elapsed during the poll/skip ──────
-            # Overruns are expected (and logged at DEBUG) whenever the device was
-            # offline before or after the poll — covering going-offline, staying-
-            # offline, and coming-online transitions.  Only a poll where the device
-            # was online both before and after is a genuine unexpected overrun.
+            # ── Advance cycle until the next deadline is in the future ──────────
             cycle += 1
             now = loop.time()
-            due_cycle = int((now - origin) / self.poll_interval)
-            while cycle < due_cycle:
+            while origin + cycle * self.poll_interval <= now:
                 if not poll_ran or was_offline or self._was_offline:
                     log.debug("Poller %s: skipping overrun slot %d (device offline)",
                               self.ip, cycle + 1)
@@ -1098,11 +1093,10 @@ class SNMPPoller:
                 cycle += 1
 
             # ── Sleep until the start of the next slot ────────────────────────
-            sleep_for = (origin + cycle * self.poll_interval) - loop.time()
-            if sleep_for > 0:
-                log.debug("Poller %s: sleeping %.3fs until slot %d",
-                          self.ip, sleep_for, cycle + 1)
-                await asyncio.sleep(sleep_for)
+            sleep_for = origin + cycle * self.poll_interval - now
+            log.debug("Poller %s: sleeping %.3fs until slot %d",
+                      self.ip, sleep_for, cycle + 1)
+            await asyncio.sleep(sleep_for)
 
     def _resolve_oid_key(self, oid_cfg: OIDConfig, results: Dict[str, Any]) -> Optional[str]:
         """
