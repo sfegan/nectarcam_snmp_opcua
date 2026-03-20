@@ -158,7 +158,7 @@ def setup_logging(level: str, log_file: Optional[str]) -> logging.Logger:
     # accumulate duplicate handlers and produce doubled log lines.
     logger.handlers.clear()
     fmt = logging.Formatter(
-        "%(asctime)s  %(levelname)-8s  %(name)s  %(message)s",
+        "%(asctime)s.%(msecs)03d  %(levelname)-8s  %(name)s  %(message)s",
         datefmt="%Y-%m-%dT%H:%M:%S",
     )
     handlers: list[logging.Handler] = [logging.StreamHandler(sys.stdout)]
@@ -1207,6 +1207,7 @@ class SNMPPoller:
         recovery.
         """
         now = time.monotonic()
+        wall_now = datetime.datetime.now(datetime.timezone.utc)
 
         results = await self._get_all_oids()
 
@@ -1300,10 +1301,9 @@ class SNMPPoller:
                     self._apply_staleness(oid_cfg.opcua_name, entry, now)
 
         # ── Update polling_timestamp and polling_age on success ───────────────
-        # Stamped with the initiation time of this cycle (now), so polling_age
-        # resets to ~0.0 on success and polling_timestamp reflects when the
-        # request was sent rather than when the response arrived.
-        wall_now = datetime.datetime.now(datetime.timezone.utc)
+        # Stamped with the initiation time of this cycle (now/wall_now), so
+        # polling_age resets to ~0.0 on success and polling_timestamp reflects
+        # when the request was sent rather than when the response arrived.
         self._store["polling_timestamp"].data_value = ua.DataValue(
             ua.Variant(wall_now, ua.VariantType.DateTime)
         )
