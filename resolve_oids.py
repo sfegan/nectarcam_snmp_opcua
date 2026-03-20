@@ -3,16 +3,25 @@
 resolve_oids.py
 ───────────────
 Read one or more device-config JSON files (same format as snmp_asyncua_bridge.py),
-resolve every symbolic OID name to dotted-decimal notation using the same logic
-the bridge uses at startup, and write the fully-resolved configs to stdout as JSON.
+resolve every OID string in the config and write the updated configs to stdout as JSON.
+
+Default (forward) mode
+  Symbolic OID names  →  dotted-decimal notation.
+  Uses the same resolution logic as the bridge (snmptranslate, then pysnmp).
+
+Reverse mode  (-r / --reverse)
+  Dotted-decimal OIDs  →  symbolic names (MODULE::objectName.instance).
+  Relies solely on ``snmptranslate -OS`` (net-snmp must be installed).
+  OIDs that are already symbolic, or that snmptranslate cannot look up, are
+  left unchanged and a warning is printed to stderr (non-fatal).
 
 Multi-IP configs (where "ip" is a JSON array) are left as-is — they are NOT
 expanded into one config per address.  The only modification made to each config
-is that symbolic OID names are replaced with their dotted-decimal equivalents.
+is that OID strings are translated as described above.
 
 Usage
 -----
-    python resolve_oids.py devices.json [more.json ...]
+    python resolve_oids.py [-r] devices.json [more.json ...]
 
 Output
 ------
@@ -23,14 +32,19 @@ Output
 
 Exit codes
 ----------
-  0  All OIDs resolved; JSON written to stdout.
-  1  One or more OIDs could not be resolved, or a config file could not be
-     read / parsed.  An error message is printed to stderr; nothing is written
-     to stdout.
+  0  All applicable OIDs translated (or left unchanged in reverse mode);
+     JSON written to stdout.
+  1  One or more OIDs could not be resolved in forward mode, or a config file
+     could not be read / parsed.  An error message is printed to stderr;
+     nothing is written to stdout.
 """
 
+import argparse
 import json
 import os
+import re
+import shutil
+import subprocess
 import sys
 
 # ── locate the bridge module ──────────────────────────────────────────────────
@@ -46,6 +60,50 @@ except ImportError as _e:
              "Ensure resolve_oids.py is in the same directory as snmp_asyncua_bridge.py.")
 
 # ─────────────────────────────────────────────────────────────────────────────
+
+
+_DOTTED_RE = re.compile(r'^\.?\d+(\.\d+)+$')
+
+
+def _is_dotted(oid: str) -> bool:
+    return bool(_DOTTED_RE.match(oid))
+
+
+def unresolve_oid(oid: str) -> tuple[str, bool]:
+    """
+    Convert a dotted-decimal OID to its symbolic name using ``snmptranslate -OS``.
+
+    Returns ``(result, changed)`` where *result* is the symbolic name on
+    success, or the original *oid* string if the translation failed (either
+    because snmptranslate is unavailable, or the OID is unknown).
+    *changed* is True when the OID was actually translated.
+
+    OIDs that are already symbolic are returned unchanged (changed=False).
+    """
+    if not _is_dotted(oid):
+        return oid, False          # already symbolic — nothing to do
+
+    if shutil.which("snmptranslate") is None:
+        return oid, False
+
+    try:
+        result = subprocess.run(
+            ["snmptranslate", "-m", "ALL", "-OS", oid],
+            capture_output=True, text=True, timeout=30,
+        )
+        if result.returncode == 0:
+            symbolic = result.stdout.strip()
+            # Reject partial translations like "SNMPv2-SMI::enterprises.96.101…"
+            # where snmptranslate reached the limit of its installed MIBs and
+            # left a numeric suffix.  The part after "::" (or the whole string
+            # when there is no "::") must not begin with a digit.
+            stem = symbolic.split("::", 1)[-1]   # drop "MODULE::" if present
+            if symbolic and not _is_dotted(symbolic) and not stem[0].isdigit():
+                return symbolic, True
+    except (subprocess.TimeoutExpired, OSError):
+        pass
+
+    return oid, False
 
 
 def load_raw_configs(paths: list) -> tuple:
@@ -90,54 +148,96 @@ def load_raw_configs(paths: list) -> tuple:
     return all_configs, output_as_list
 
 
-def resolve_config(cfg: dict) -> dict:
+def resolve_config(cfg: dict, *, reverse: bool = False) -> tuple[dict, list[str]]:
     """
-    Return a copy of *cfg* with every OID string replaced by its
-    dotted-decimal equivalent.
+    Return ``(updated_cfg, warnings)``.
 
-    Raises ValueError (from resolve_oid_name) if any OID cannot be resolved.
-    The message identifies which device / OID entry failed so the caller can
-    report it clearly.
+    Forward mode (reverse=False):
+      Every symbolic OID name is replaced by its dotted-decimal equivalent.
+      Raises ValueError if any OID cannot be resolved.
+
+    Reverse mode (reverse=True):
+      Every dotted-decimal OID is replaced by its symbolic name via
+      ``snmptranslate -OS``.  OIDs that cannot be translated are left
+      unchanged and a warning string is appended to *warnings*.
     """
-    # Determine a human-readable device identifier for error messages.
-    # For multi-IP configs "ip" is a list; show the first address in that case.
+    # Determine a human-readable device identifier for error/warning messages.
     ip = cfg.get("ip", "?")
     device_id = cfg.get("opcua_path") or (ip[0] if isinstance(ip, list) else ip)
 
     out = dict(cfg)
     resolved_oids = []
+    warnings: list[str] = []
+
     for i, oid_entry in enumerate(cfg.get("oids", [])):
         entry = dict(oid_entry)
         raw = entry.get("oid", "")
-        try:
-            entry["oid"] = resolve_oid_name(raw)
-        except ValueError as exc:
-            raise ValueError(
-                f"Device {device_id!r}, OID entry {i} ({raw!r}): {exc}"
-            ) from exc
+
+        if reverse:
+            symbolic, changed = unresolve_oid(raw)
+            if not changed and _is_dotted(raw):
+                warnings.append(
+                    f"Device {device_id!r}, OID entry {i} ({raw!r}): "
+                    "snmptranslate could not resolve this OID — left unchanged"
+                )
+            entry["oid"] = symbolic
+        else:
+            try:
+                entry["oid"] = resolve_oid_name(raw)
+            except ValueError as exc:
+                raise ValueError(
+                    f"Device {device_id!r}, OID entry {i} ({raw!r}): {exc}"
+                ) from exc
+
         resolved_oids.append(entry)
+
     out["oids"] = resolved_oids
-    return out
+    return out, warnings
 
 
 def main() -> None:
-    if len(sys.argv) < 2 or sys.argv[1] in ("-h", "--help"):
-        print(__doc__)
-        sys.exit(0)
+    parser = argparse.ArgumentParser(
+        description=__doc__,
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+    )
+    parser.add_argument(
+        "-r", "--reverse",
+        action="store_true",
+        help="Reverse mode: convert dotted-decimal OIDs to symbolic names "
+             "using snmptranslate. Unresolvable OIDs are left unchanged "
+             "(warning printed to stderr).",
+    )
+    parser.add_argument(
+        "configs",
+        nargs="+",
+        metavar="FILE",
+        help="One or more device-config JSON files.",
+    )
+    args = parser.parse_args()
 
-    paths = sys.argv[1:]
+    if args.reverse and shutil.which("snmptranslate") is None:
+        sys.exit("ERROR: snmptranslate not found — install net-snmp to use reverse mode.")
 
     # ── load raw configs (no expansion) ──────────────────────────────────────
-    configs, output_as_list = load_raw_configs(paths)
+    configs, output_as_list = load_raw_configs(args.configs)
 
-    # ── resolve all OIDs — collect every failure before aborting ─────────────
+    # ── translate all OIDs — collect every failure before aborting ────────────
     errors = []
+    all_warnings = []
     resolved = []
     for cfg in configs:
         try:
-            resolved.append(resolve_config(cfg))
+            out_cfg, warnings = resolve_config(cfg, reverse=args.reverse)
+            resolved.append(out_cfg)
+            all_warnings.extend(warnings)
         except ValueError as exc:
             errors.append(str(exc))
+
+    if all_warnings:
+        print("WARNING: the following OID(s) could not be reverse-resolved "
+              "and were left unchanged:", file=sys.stderr)
+        for msg in all_warnings:
+            print(f"  • {msg}", file=sys.stderr)
 
     if errors:
         print("ERROR: could not resolve the following OID(s):", file=sys.stderr)
