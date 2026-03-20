@@ -1687,6 +1687,14 @@ def parse_args() -> argparse.Namespace:
             "is ignored."
         ),
     )
+    p.add_argument(
+        "--publish-local-oids",
+        action="store_true",
+        default=False,
+        help=(
+            "Strip leading underscores from local (underscore-prefixed) OID names "            "so they are published as OPC UA variables instead of being kept "            "server-side only.  Intended for testing and diagnostics."
+        ),
+    )
     return p.parse_args()
 
 
@@ -1812,7 +1820,10 @@ def _expand_multi_ip(cfg: dict) -> List[dict]:
     return expanded
 
 
-def load_device_configs(paths: List[str]) -> List[dict]:
+def load_device_configs(
+    paths: List[str],
+    strip_leading_underscore: bool = False,
+) -> List[dict]:
     """
     Load device configuration(s) from one or more JSON files.
 
@@ -1820,8 +1831,13 @@ def load_device_configs(paths: List[str]) -> List[dict]:
       • a JSON object  → treated as a single device configuration
       • a JSON array   → treated as a list of device configurations
 
-    When a config's "ip" field is a JSON array of strings, it is
+    When a config's "host" field is a JSON array of strings, it is
     automatically expanded into one config per address (see _expand_multi_ip).
+
+    When *strip_leading_underscore* is True, the leading underscore is removed
+    from the opcua_name of every OID entry whose name starts with _.
+    This causes those OIDs to be published as OPC UA variables rather than kept
+    as server-side-only local values.  Intended for testing and diagnostics.
 
     All files are merged into a single flat list and returned.
     Exits with an error message if any file cannot be read or parsed.
@@ -1853,7 +1869,12 @@ def load_device_configs(paths: List[str]) -> List[dict]:
             )
 
         for raw_cfg in raw_list:
-            configs.extend(_expand_multi_ip(raw_cfg))
+            for expanded_cfg in _expand_multi_ip(raw_cfg):
+                if strip_leading_underscore:
+                    for oid in expanded_cfg.get("oids", []):
+                        if oid.get("opcua_name", "").startswith("_"):
+                            oid["opcua_name"] = oid["opcua_name"].lstrip("_")
+                configs.append(expanded_cfg)
 
     return configs
 
@@ -1880,7 +1901,7 @@ async def async_main() -> None:
     log.info("OPC UA root path: %s", root_display)
 
     if args.device_configs:
-        configs = load_device_configs(args.device_configs)
+        configs = load_device_configs(args.device_configs, strip_leading_underscore=args.publish_local_oids)
         log.info("Using %d device config(s) from command-line JSON file(s)", len(configs))
     else:
         configs = EXAMPLE_CONFIGS
