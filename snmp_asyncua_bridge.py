@@ -266,8 +266,15 @@ def _snmp_value_to_python(raw_value: Any) -> Any:
     enabled).  Returning bytes lets _cast_to_ua() apply the correct conversion
     to whichever OPC UA type the configuration declares (String, ByteString,
     etc.), and keeps the behaviour consistent regardless of MIB availability.
+
+    TimeTicks is returned as a datetime.timedelta (the natural Python type for
+    a duration) rather than as a raw centisecond integer.  _cast_to_ua() then
+    converts it to milliseconds for any numeric UA type, or to the str()
+    representation (e.g. "5:23:49.160000") for String.
     """
-    if isinstance(raw_value, (Integer, Integer32, TimeTicks,
+    if isinstance(raw_value, TimeTicks):
+        return datetime.timedelta(seconds=int(raw_value) / 100)
+    if isinstance(raw_value, (Integer, Integer32,
                                Counter32, Counter64, Gauge32, Unsigned32)):
         return int(raw_value)
     if isinstance(raw_value, IpAddress):
@@ -295,10 +302,19 @@ def _cast_to_ua(value: Any, opcua_type: str) -> ua.DataValue | ua.Variant:
     also decoded to a string first so that DisplayString OIDs whose values are
     numeric (e.g. wrpcTemperatureValue = b"41.9375") can be cast correctly.
     Without this, float(b"41.9375") would raise TypeError.
+
+    datetime.timedelta values (from TimeTicks OIDs) are converted to
+    milliseconds (as a float) for any numeric UA type, or to their str()
+    representation (e.g. "5:23:49.160000") for String.
     """
     variant_type, cast_fn = _UA_TYPE_MAP[opcua_type]
     try:
-        if isinstance(value, (bytes, bytearray)) and opcua_type != "ByteString":
+        if isinstance(value, datetime.timedelta):
+            if opcua_type == "String":
+                value = str(value)
+            else:
+                value = value.total_seconds() * 1000.0
+        elif isinstance(value, (bytes, bytearray)) and opcua_type != "ByteString":
             try:
                 value = value.decode("utf-8").strip()
             except UnicodeDecodeError:
