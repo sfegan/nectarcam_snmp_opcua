@@ -216,6 +216,28 @@ _UA_TYPE_ZEROS: Dict[str, Any] = {
 }
 
 
+# Names of the built-in variables added automatically by SNMPPoller to every
+# device node.  Defined once here so __post_init__, docstrings, and any other
+# code that needs the set can reference a single authoritative source.
+#
+# Ordering reflects the logical grouping used in build_variable_specs() and
+# _init_store():
+#   identity       : snmp_host, snmp_port
+#   polling metrics: snmp_polling_timestamp, snmp_polling_age,
+#                    snmp_polling_interval, snmp_polling_success_count
+#   state flags    : snmp_server_online (bridge fact), cls_state (overridable)
+_BUILTIN_VARIABLE_NAMES: frozenset[str] = frozenset({
+    "snmp_host",
+    "snmp_port",
+    "snmp_polling_timestamp",
+    "snmp_polling_age",
+    "snmp_polling_interval",
+    "snmp_polling_success_count",
+    "snmp_server_online",
+    "cls_state",
+})
+
+
 def _make_status_dv(opcua_type: str, status: ua.StatusCode) -> ua.DataValue:
     """
     Build a ua.DataValue carrying *status* and a typed zero value for *opcua_type*.
@@ -429,17 +451,23 @@ class ConstantConfig:
     Both *value* and *description* support ``{instance}`` substitution when the
     parent device config uses a multi-IP array (see _expand_multi_ip).
 
-    The *lifetime* is stored in the data store entry and is available to
-    subclasses.  The base class does not enforce it for constants (since they are
-    not updated by polling), but derived classes may use it for computed/derived
-    constant-like variables.  0 means never expire; the default of 0 means
-    constants are always considered valid unless a subclass acts on the lifetime.
+    The *lifetime* field controls expiry of the store entry and uses the same
+    sentinel convention as OIDConfig:
+
+      lifetime == -1  (default)
+          Resolved automatically in _init_store():
+            • value is not None  →  0.0  (true constant, never expires)
+            • value is None      →  device default_lifetime  (derived variable,
+                                    expires like a polled OID when its sources
+                                    are unavailable)
+      lifetime >= 0
+          Used as-is, overriding the automatic resolution above.
     """
     opcua_name: str           # variable name on the OPC UA side
     opcua_type: str           # one of the keys in _UA_TYPE_MAP
     value: Any                # the constant value, or None for BadWaitingForInitialData
     description: str = ""
-    lifetime: float = 0.0  # seconds; 0 = never expire (not enforced by base class)
+    lifetime: float = -1.0  # seconds; -1 = resolve automatically (see docstring)
 
     def __post_init__(self):
         if self.opcua_type not in _UA_TYPE_MAP:
@@ -510,13 +538,16 @@ class SNMPPoller:
     """
     Polls a single SNMP device (SNMPv2c) and writes values to OPC UA nodes.
 
-    Automatically adds six built-in variables to the OPC UA object:
-      • host               (String)    – IP address of the device
-      • port               (UInt16)    – UDP port of the SNMP agent
-      • cls_state          (Byte)      – 0 = offline, 1 = online
-      • polling_timestamp  (DateTime)  – wall-clock time of the last successful poll
-      • polling_age        (Double)    – seconds since the last successful poll (always Good)
-      • polling_interval   (Double)    – configured poll interval in seconds
+    Automatically adds eight built-in variables to the OPC UA object
+    (see also ``_BUILTIN_VARIABLE_NAMES``):
+      • snmp_host                   (String)    – IP address of the device
+      • snmp_port                   (UInt16)    – UDP port of the SNMP agent
+      • snmp_polling_timestamp      (DateTime)  – wall-clock time of the last successful poll
+      • snmp_polling_age            (Double)    – seconds since the last successful poll (always Good)
+      • snmp_polling_interval       (Double)    – configured poll interval in seconds
+      • snmp_polling_success_count  (UInt32)    – cumulative count of successful polls (always Good)
+      • snmp_server_online          (Boolean)   – True when SNMP agent is reachable; never modified by subclasses
+      • cls_state                   (Byte)      – 0 = offline, 1 = online (may be overridden by subclasses)
 
     OID variables whose ``opcua_name`` begins with ``"_"`` are *local*: they are
     polled from SNMP and stored in the internal data store but no OPC UA node is
@@ -527,7 +558,7 @@ class SNMPPoller:
     -------------------------------------
     A dict mapping ``opcua_name`` → ``StoreEntry`` for every variable managed by
     this poller: OID variables (local and published), constants, and server
-    variables (host, port, cls_state, polling_timestamp, polling_interval).
+    variables listed in ``_BUILTIN_VARIABLE_NAMES``.
 
     Each entry tracks:
       • ``data_value``       – current ua.DataValue (value + status)
@@ -625,16 +656,14 @@ class SNMPPoller:
         # Names reserved for built-in server variables — cannot be used as OID
         # or constant names because they would silently overwrite each other's
         # OPC UA node in _node_map and their store entries.
-        _RESERVED = {"host", "port", "cls_state", "polling_timestamp", "polling_age", "polling_interval"}
-
         # Detect duplicate opcua_name values within this poller's OID list and
-        # constants, and guard against collisions with reserved names.
+        # constants, and guard against collisions with the built-in variable names.
         seen: set[str] = set()
         for o in self.oids:
-            if o.opcua_name in _RESERVED:
+            if o.opcua_name in _BUILTIN_VARIABLE_NAMES:
                 raise ValueError(
                     f"OID opcua_name {o.opcua_name!r} in poller {self.opcua_path!r} "
-                    f"conflicts with a reserved server variable name: {sorted(_RESERVED)}"
+                    f"conflicts with a built-in variable name: {sorted(_BUILTIN_VARIABLE_NAMES)}"
                 )
             if o.opcua_name in seen:
                 raise ValueError(
@@ -642,10 +671,10 @@ class SNMPPoller:
                 )
             seen.add(o.opcua_name)
         for c in self.constants:
-            if c.opcua_name in _RESERVED:
+            if c.opcua_name in _BUILTIN_VARIABLE_NAMES:
                 raise ValueError(
                     f"Constant opcua_name {c.opcua_name!r} in poller {self.opcua_path!r} "
-                    f"conflicts with a reserved server variable name: {sorted(_RESERVED)}"
+                    f"conflicts with a built-in variable name: {sorted(_BUILTIN_VARIABLE_NAMES)}"
                 )
             if c.opcua_name in seen:
                 raise ValueError(
@@ -696,7 +725,7 @@ class SNMPPoller:
         Build and return the complete dict of NodeSpecs for this poller.
 
         Keys are opcua_name strings.  The dict is ordered: built-ins first
-        (host, port, cls_state, polling_timestamp, polling_age, polling_interval),
+        (see _BUILTIN_VARIABLE_NAMES for the canonical ordered list),
         then published OID variables (local/underscore-prefixed OIDs are omitted —
         they have no OPC UA node), then constants.
 
@@ -707,37 +736,50 @@ class SNMPPoller:
         specs: Dict[str, NodeSpec] = {}
 
         # ── built-in server metadata variables ───────────────────────────────
-        specs["host"] = NodeSpec(
+        specs["snmp_host"] = NodeSpec(
             opcua_type="String",
             initial_value=self.ip,
             description="IP address of the SNMP device",
         )
-        specs["port"] = NodeSpec(
+        specs["snmp_port"] = NodeSpec(
             opcua_type="UInt16",
             initial_value=self.port,
             description="UDP port of the SNMP agent",
         )
-        specs["cls_state"] = NodeSpec(
-            opcua_type="Byte",
-            initial_value=0,
-            description="Device state: 0 = offline, 1 = online",
-        )
-        specs["polling_timestamp"] = NodeSpec(
+        specs["snmp_polling_timestamp"] = NodeSpec(
             opcua_type="DateTime",
             initial_value=datetime.datetime.fromtimestamp(0, tz=datetime.timezone.utc),
             description="Wall-clock time of the last successful poll",
             initial_status=ua.StatusCode(ua.StatusCodes.BadWaitingForInitialData),
         )
-        specs["polling_age"] = NodeSpec(
+        specs["snmp_polling_age"] = NodeSpec(
             opcua_type="Double",
             initial_value=0.0,
             description="Seconds since the last successful poll (always Good status)",
             initial_status=ua.StatusCode(ua.StatusCodes.BadWaitingForInitialData),
         )
-        specs["polling_interval"] = NodeSpec(
+        specs["snmp_polling_interval"] = NodeSpec(
             opcua_type="Double",
             initial_value=self.poll_interval,
             description="Configured poll interval in seconds",
+        )
+        specs["snmp_polling_success_count"] = NodeSpec(
+            opcua_type="UInt32",
+            initial_value=0,
+            description="Cumulative count of successful SNMP polls (always Good status)",
+        )
+        specs["snmp_server_online"] = NodeSpec(
+            opcua_type="Boolean",
+            initial_value=False,
+            description=(
+                "True when the SNMP agent is reachable. "
+                "Mirrors the bridge reachability state; never modified by subclasses."
+            ),
+        )
+        specs["cls_state"] = NodeSpec(
+            opcua_type="Byte",
+            initial_value=0,
+            description="Device state: 0 = offline, 1 = online",
         )
 
         # ── SNMP-polled OID variables (published only — skip local ones) ─────
@@ -892,10 +934,9 @@ class SNMPPoller:
 
         # ── server variables ──────────────────────────────────────────────────
         for name, opcua_type, value in [
-            ("host",              "String",   self.ip),
-            ("port",              "UInt16",   self.port),
-            ("cls_state",         "Byte",     0),
-            ("polling_interval",  "Double",   self.poll_interval),
+            ("snmp_host",             "String",  self.ip),
+            ("snmp_port",             "UInt16",  self.port),
+            ("snmp_polling_interval", "Double",  self.poll_interval),
         ]:
             variant_type, cast_fn = _UA_TYPE_MAP[opcua_type]
             self._store[name] = StoreEntry(
@@ -906,20 +947,44 @@ class SNMPPoller:
                 is_local=False,
             )
 
-        # polling_timestamp and polling_age start as BadWaitingForInitialData;
+        # snmp_polling_timestamp and snmp_polling_age start as BadWaitingForInitialData;
         # both are updated only on a successful SNMP poll.
-        self._store["polling_timestamp"] = StoreEntry(
+        self._store["snmp_polling_timestamp"] = StoreEntry(
             data_value=_make_status_dv("DateTime", _waiting),
             timestamp=None,
             lifetime=0.0,
             opcua_type="DateTime",
             is_local=False,
         )
-        self._store["polling_age"] = StoreEntry(
+        self._store["snmp_polling_age"] = StoreEntry(
             data_value=_make_status_dv("Double", _waiting),
             timestamp=None,
             lifetime=0.0,
             opcua_type="Double",
+            is_local=False,
+        )
+        # snmp_polling_success_count: server-side counter, always Good, never expires.
+        self._store["snmp_polling_success_count"] = StoreEntry(
+            data_value=ua.DataValue(ua.Variant(0, ua.VariantType.UInt32)),
+            timestamp=time.monotonic(),
+            lifetime=0.0,
+            opcua_type="UInt32",
+            is_local=False,
+        )
+        # snmp_server_online: bridge-level reachability flag, always Good, never expires.
+        # Set only by _poll_once(); subclasses must not modify this entry.
+        self._store["snmp_server_online"] = StoreEntry(
+            data_value=ua.DataValue(ua.Variant(False, ua.VariantType.Boolean)),
+            timestamp=time.monotonic(),
+            lifetime=0.0,
+            opcua_type="Boolean",
+            is_local=False,
+        )
+        self._store["cls_state"] = StoreEntry(
+            data_value=ua.DataValue(ua.Variant(0, ua.VariantType.Byte)),
+            timestamp=time.monotonic(),
+            lifetime=0.0,
+            opcua_type="Byte",
             is_local=False,
         )
 
@@ -950,10 +1015,21 @@ class SNMPPoller:
                     dv = variant   # cast failed — already a bad-status DataValue
                 else:
                     dv = ua.DataValue(variant)
+            # Resolve effective lifetime using the same sentinel convention as OIDs:
+            #   -1 + real value  → 0.0  (true constant, never expires)
+            #   -1 + None value  → device default_lifetime  (derived variable)
+            #   explicit >= 0    → use as-is
+            if const_cfg.lifetime < 0:
+                if const_cfg.value is not None:
+                    effective_lifetime = 0.0
+                else:
+                    effective_lifetime = self.default_lifetime
+            else:
+                effective_lifetime = const_cfg.lifetime
             self._store[const_cfg.opcua_name] = StoreEntry(
                 data_value=dv,
                 timestamp=time.monotonic() if const_cfg.value is not None else None,
-                lifetime=const_cfg.lifetime,
+                lifetime=effective_lifetime,
                 opcua_type=const_cfg.opcua_type,
                 is_local=False,
             )
@@ -1186,7 +1262,7 @@ class SNMPPoller:
 
         Responsibilities
         ----------------
-        • Update polling_timestamp and polling_age only on a successful poll,
+        • Update snmp_polling_timestamp and snmp_polling_age only on a successful poll,
           using the initiation time (captured before the GET) so they reflect
           when the request was sent rather than when the response arrived.
         • On a successful response: update store entries for every OID that
@@ -1221,13 +1297,16 @@ class SNMPPoller:
             self._store["cls_state"].data_value = ua.DataValue(
                 ua.Variant(0, ua.VariantType.Byte)
             )
+            self._store["snmp_server_online"].data_value = ua.DataValue(
+                ua.Variant(False, ua.VariantType.Boolean)
+            )
 
-            # polling_age keeps ticking even while offline using the initiation
+            # snmp_polling_age keeps ticking even while offline using the initiation
             # time of this cycle vs the timestamp of the last successful poll.
-            # polling_timestamp is NOT updated — it stays at the last success.
-            last_ts = self._store["polling_timestamp"].timestamp
+            # snmp_polling_timestamp is NOT updated — it stays at the last success.
+            last_ts = self._store["snmp_polling_timestamp"].timestamp
             if last_ts is not None:
-                self._store["polling_age"].data_value = ua.DataValue(
+                self._store["snmp_polling_age"].data_value = ua.DataValue(
                     ua.Variant(now - last_ts, ua.VariantType.Double)
                 )
 
@@ -1294,21 +1373,29 @@ class SNMPPoller:
                 if entry is not None:
                     self._apply_staleness(oid_cfg.opcua_name, entry, now)
 
-        # ── Update polling_timestamp and polling_age on success ───────────────
+        # ── Update snmp_polling_timestamp and snmp_polling_age on success ───────────────
         # Stamped with the initiation time of this cycle (now/wall_now), so
-        # polling_age resets to ~0.0 on success and polling_timestamp reflects
+        # snmp_polling_age resets to ~0.0 on success and snmp_polling_timestamp reflects
         # when the request was sent rather than when the response arrived.
-        self._store["polling_timestamp"].data_value = ua.DataValue(
+        self._store["snmp_polling_timestamp"].data_value = ua.DataValue(
             ua.Variant(wall_now, ua.VariantType.DateTime)
         )
-        self._store["polling_timestamp"].timestamp = now
-        self._store["polling_age"].data_value = ua.DataValue(
+        self._store["snmp_polling_timestamp"].timestamp = now
+        self._store["snmp_polling_age"].data_value = ua.DataValue(
             ua.Variant(0.0, ua.VariantType.Double)
         )
-        self._store["polling_age"].timestamp = now
+        self._store["snmp_polling_age"].timestamp = now
 
         self._store["cls_state"].data_value = ua.DataValue(
             ua.Variant(1, ua.VariantType.Byte)
+        )
+        self._store["snmp_server_online"].data_value = ua.DataValue(
+            ua.Variant(True, ua.VariantType.Boolean)
+        )
+        # Increment success counter, wrapping at UInt32 max.
+        prev = self._store["snmp_polling_success_count"].data_value.Value.Value
+        self._store["snmp_polling_success_count"].data_value = ua.DataValue(
+            ua.Variant((prev + 1) & 0xFFFFFFFF, ua.VariantType.UInt32)
         )
         await self.write_variables()
 
