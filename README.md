@@ -56,7 +56,10 @@ python snmp_asyncua_bridge.py \
 - `--opcua-user`: Username and password for OPC UA authentication in `USER:PASS` format (optional, enables authentication)
 - `--log-level`: Logging level (DEBUG, INFO, WARNING, ERROR, CRITICAL; default: INFO)
 - `--log-file`: Optional log file path
+- `--snmp-timeout`: SNMP request timeout in seconds (per attempt) (default: 2.0). Can be overridden per device in JSON config.
+- `--snmp-retries`: Number of SNMP retries after the first attempt (default: 1). Can be overridden per device in JSON config.
 - `--device-config`: Path to JSON configuration file (can be specified multiple times)
+- `--publish-local-oids`: Strip leading underscores from local (underscore-prefixed) OID names so they are published as OPC UA variables instead of being kept server-side only. Intended for testing and diagnostics.
 
 ## Configuration
 
@@ -66,7 +69,7 @@ Devices are configured using JSON files specified with the `--device-config` opt
 
 Each device configuration is a JSON object with the following fields:
 
-- `ip` (string or array of strings): IP address(es) of the SNMP device(s). If an array, multiple identical devices are created with `{instance}` placeholder substitution.
+- `host` (string or array of strings): IP address(es) of the SNMP device(s). If an array, multiple identical devices are created with `{instance}` placeholder substitution.
 - `port` (integer, optional): SNMP port (default: 161)
 - `community` (string, optional): SNMP community string (default: "public")
 - `description` (string, optional): Human-readable description of the device
@@ -92,7 +95,7 @@ Each OID in the `oids` array is a JSON object with:
 Each constant in the `constants` array is a JSON object with:
 
 - `opcua_name` (string): Name of the OPC UA variable
-- `opcua_type` (string): OPC UA data type. Supported types: `Boolean`, `SByte`, `Byte`, `Int16`, `UInt16`, `Int32`, `UInt32`, `Int64`, `UInt64`, `Float`, `Double`, `String`, `ByteString`
+- `opcua_type` (string): OPC UA data type. Supported types: `Boolean`, `SByte`, `Byte`, `Int16`, `UInt16`, `Int32`, `UInt32`, `Int64`, `UInt64`, `Float`, `Double`, `String`, `ByteString`, `DateTime`
 - `value` (any): The constant value to write (must be compatible with `opcua_type`)
 - `description` (string, optional): Description of the constant
 - `lifetime` (number, optional): Lifetime in seconds for this constant variable (default: 0, meaning never expire; not enforced for constants)
