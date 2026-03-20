@@ -24,6 +24,8 @@ Each SNMPPoller is built from a dict like:
         "description": "Main distribution switch, rack A",  # optional, defaults to ""
         "opcua_path":  "Switch01",      # relative to --opcua-root (or Objects/ if root is empty)
         "poll_interval": 10,            # optional, defaults to 10 (seconds)
+        "snmp_timeout":  2.0,           # optional, defaults to 2.0 (seconds per attempt)
+        "snmp_retries":  1,             # optional, defaults to 1
         "default_lifetime": 30, # optional; per-OID default for lifetime (0 = never expire)
         "oids": [
             {
@@ -555,6 +557,14 @@ class SNMPPoller:
                               calling ``super().write_variables()``, which writes
                               every non-local store entry to its OPC UA node.
     on_address_space_ready()  Called once after all nodes have been created.
+
+    Polling loop
+    ------------
+    ``run()`` is phase-locked: each slot is exactly ``poll_interval`` seconds
+    wide.  If a poll overruns into future slots, the missed slots are logged and
+    skipped.  If the previous poll is still in flight when the next slot fires
+    (possible when ``snmp_timeout * (snmp_retries + 1) > poll_interval``), that
+    slot is skipped entirely with a warning — no store updates, no OPC UA writes.
     """
 
     # ── config ────────────────────────────────────────────────────────────────
@@ -564,6 +574,8 @@ class SNMPPoller:
     description: str          # human-readable device description (written to OPC UA object)
     opcua_path: str           # dot-separated path relative to root, e.g. "Switch01"
     poll_interval: float      # seconds
+    snmp_timeout: float = 2.0   # seconds per SNMP request attempt
+    snmp_retries: int = 1       # number of retries after the first attempt
     oids: List[OIDConfig]
     constants: List[ConstantConfig] = field(default_factory=list)
     # Default maximum lifetime (seconds) for OID variables that do not specify
@@ -576,6 +588,10 @@ class SNMPPoller:
     # this poller (OIDs, constants, server variables).  Populated in
     # _init_store() which is called from on_address_space_ready().
     _store: Dict[str, "StoreEntry"] = field(default_factory=dict, init=False, repr=False)
+    # Lock that prevents concurrent polls.  If a poll cycle starts while the
+    # previous one is still awaiting its SNMP response, the new cycle is skipped
+    # entirely and the in-flight poll is left to complete normally.
+    _poll_lock: asyncio.Lock = field(default_factory=asyncio.Lock, init=False, repr=False)
     # The asyncua Object node for this device — available to subclasses from
     # on_address_space_ready() onwards.
     _device_node: Any = field(default=None, init=False, repr=False)
@@ -666,6 +682,8 @@ class SNMPPoller:
             description=cfg.get("description", ""),
             opcua_path=cfg["opcua_path"],
             poll_interval=float(cfg.get("poll_interval", 10)),
+            snmp_timeout=float(cfg.get("snmp_timeout", 2.0)),
+            snmp_retries=int(cfg.get("snmp_retries", 1)),
             oids=oids,
             constants=constants,
             default_lifetime=float(cfg.get("default_lifetime", 0.0)),
@@ -963,7 +981,7 @@ class SNMPPoller:
         # on every call is heavyweight and leaks resources.
         if self._transport_target is None:
             self._transport_target = await UdpTransportTarget.create(
-                (self.ip, self.port), timeout=2, retries=1
+                (self.ip, self.port), timeout=self.snmp_timeout, retries=self.snmp_retries
             )
         error_indication, error_status, error_index, var_binds = await get_cmd(
             self._snmp_engine,
@@ -1025,37 +1043,57 @@ class SNMPPoller:
         Phase-locked polling loop.  Must be called after the OPC UA nodes have
         been created (i.e. after OPCUAServer.build_address_space()).
 
-        The first poll fires immediately and its wall-clock time is recorded as
-        the phase origin.  Every subsequent deadline is origin + N * interval,
-        so accumulated drift from poll latency is corrected each cycle rather
-        than compounding.  If a poll overruns its slot the next sleep is simply
-        zero (we never skip a cycle).
+        Slot skipping
+        -------------
+        Each cycle occupies one slot of duration ``poll_interval``.  If a poll
+        overruns into future slots, every overrun slot is logged and skipped so
+        the loop re-locks to the correct phase rather than firing repeatedly to
+        catch up.
+
+        Concurrent-poll guard
+        ---------------------
+        If a poll is still in progress when the next slot fires (possible when
+        ``snmp_timeout * (snmp_retries + 1) > poll_interval``), the new slot is
+        skipped entirely — no store updates, no OPC UA writes.  The in-flight
+        poll is left to complete and will handle all staleness updates itself.
         """
-        log.info("Poller started: %s  path=%s  interval=%.1fs",
-                 self.ip, self.opcua_path, self.poll_interval)
+        log.info("Poller started: %s  path=%s  interval=%.1fs  timeout=%.1fs  retries=%d",
+                 self.ip, self.opcua_path, self.poll_interval,
+                 self.snmp_timeout, self.snmp_retries)
 
         loop = asyncio.get_running_loop()
         origin = loop.time()
         cycle = 0
 
         while True:
-            log.debug("Poller %s: starting cycle %d", self.ip, cycle + 1)
-            await self._poll_once()
+            now = loop.time()
+
+            # ── Skip any slots that have already elapsed ───────────────────────
+            # Calculate how many slots have passed since origin.  If the previous
+            # poll overran, advance cycle past all missed slots and log each one.
+            due_cycle = int((now - origin) / self.poll_interval)
+            while cycle < due_cycle:
+                log.warning("Poller %s: skipping overrun slot %d", self.ip, cycle + 1)
+                cycle += 1
+
+            # ── Sleep until the start of the current slot ─────────────────────
+            next_deadline = origin + cycle * self.poll_interval
+            sleep_for = next_deadline - now
+            if sleep_for > 0:
+                log.debug("Poller %s: sleeping %.3fs until slot %d",
+                          self.ip, sleep_for, cycle + 1)
+                await asyncio.sleep(sleep_for)
+
+            # ── Fire the poll, or skip if one is already in flight ────────────
+            log.debug("Poller %s: starting slot %d", self.ip, cycle + 1)
+            if self._poll_lock.locked():
+                log.warning("Poller %s: slot %d skipped — previous poll still in flight",
+                            self.ip, cycle + 1)
+            else:
+                async with self._poll_lock:
+                    await self._poll_once()
 
             cycle += 1
-            next_deadline = origin + cycle * self.poll_interval
-            sleep_for = next_deadline - loop.time()
-            if sleep_for > 0:
-                log.debug("Poller %s: cycle %d done, sleeping %.3fs",
-                          self.ip, cycle, sleep_for)
-                await asyncio.sleep(sleep_for)
-            else:
-                if not self._was_offline:
-                    log.warning("Poller %s overran slot by %.3fs (cycle %d)",
-                                self.ip, -sleep_for, cycle)
-                else:
-                    log.debug("Poller %s overran slot by %.3fs (cycle %d, device offline)",
-                              self.ip, -sleep_for, cycle)
 
     def _resolve_oid_key(self, oid_cfg: OIDConfig, results: Dict[str, Any]) -> Optional[str]:
         """
@@ -1532,6 +1570,20 @@ def parse_args() -> argparse.Namespace:
     )
     p.add_argument("--log-file", default=None, help="Optional log file path")
     p.add_argument(
+        "--snmp-timeout",
+        type=float,
+        default=2.0,
+        metavar="SECONDS",
+        help="SNMP request timeout in seconds (per attempt). Can be overridden per device in JSON config.",
+    )
+    p.add_argument(
+        "--snmp-retries",
+        type=int,
+        default=1,
+        metavar="N",
+        help="Number of SNMP retries after the first attempt. Can be overridden per device in JSON config.",
+    )
+    p.add_argument(
         "--device-config",
         metavar="FILE.json",
         action="append",
@@ -1746,6 +1798,10 @@ async def async_main() -> None:
 
     for cfg in configs:
         try:
+            # CLI --snmp-timeout / --snmp-retries act as fallback defaults;
+            # per-device JSON keys take precedence if present.
+            cfg.setdefault("snmp_timeout", args.snmp_timeout)
+            cfg.setdefault("snmp_retries", args.snmp_retries)
             opcua_server.register(SNMPPoller.from_dict(cfg))
         except (ValueError, KeyError) as exc:
             sys.exit(f"Invalid device configuration for "
