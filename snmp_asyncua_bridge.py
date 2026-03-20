@@ -290,14 +290,19 @@ def _cast_to_ua(value: Any, opcua_type: str) -> ua.DataValue | ua.Variant:
     (as returned by _snmp_value_to_python for OctetString), the bytes are
     decoded to a Python str using UTF-8 with a latin-1 fallback rather than
     calling str() which would produce the Python repr "b'...'".
+
+    For numeric target types (Float, Double, and integer variants), bytes are
+    also decoded to a string first so that DisplayString OIDs whose values are
+    numeric (e.g. wrpcTemperatureValue = b"41.9375") can be cast correctly.
+    Without this, float(b"41.9375") would raise TypeError.
     """
     variant_type, cast_fn = _UA_TYPE_MAP[opcua_type]
     try:
-        if opcua_type == "String" and isinstance(value, (bytes, bytearray)):
+        if isinstance(value, (bytes, bytearray)) and opcua_type != "ByteString":
             try:
-                value = value.decode("utf-8")
+                value = value.decode("utf-8").strip()
             except UnicodeDecodeError:
-                value = value.decode("latin-1")
+                value = value.decode("latin-1").strip()
         return ua.Variant(cast_fn(value), variant_type)
     except (ValueError, TypeError) as exc:
         log.warning("Type cast failed (%s → %s): %s – writing BadDataEncodingInvalid",
