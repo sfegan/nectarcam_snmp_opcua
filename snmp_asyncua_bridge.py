@@ -18,7 +18,7 @@ Configuration example
 Each SNMPPoller is built from a dict like:
 
     {
-        "ip":          "192.168.1.10",
+        "host":        "192.168.1.10",
         "port":        161,             # optional, defaults to 161
         "community":   "public",        # optional, defaults to "public"
         "description": "Main distribution switch, rack A",  # optional, defaults to ""
@@ -70,17 +70,17 @@ Supported opcua_type values
 
 Multiple identical devices (ip array)
 --------------------------------------
-When "ip" is a JSON array of strings, one SNMPPoller is created per
+When "host" is a JSON array of strings, one SNMPPoller is created per
 address.  The fields "opcua_path" and "description" may contain the
 placeholder {instance}, which is replaced with the zero-based index of
 the address in the array using Python str.format_map(), so any format
 spec is valid:
 
-    "ip":         ["192.168.1.10", "192.168.1.11", "192.168.1.12"],
+    "host":       ["192.168.1.10", "192.168.1.11", "192.168.1.12"],
     "opcua_path": "Switch{instance:02d}",
     "description": "Distribution switch {instance}",
 
-If "ip" is an array and "opcua_path" does not contain {instance}, a
+If "host" is an array and "opcua_path" does not contain {instance}, a
 warning is logged and "_{instance}" is appended automatically as a fallback.
 
 Within each entry in "constants", {instance} is substituted into the
@@ -599,7 +599,7 @@ class SNMPPoller:
     """
 
     # ── config ────────────────────────────────────────────────────────────────
-    ip: str
+    host: str
     port: int
     community: str
     description: str          # human-readable device description (written to OPC UA object)
@@ -705,7 +705,7 @@ class SNMPPoller:
                     f"has an unrecognised field: {exc}"
                 ) from exc
         return cls(
-            ip=cfg["ip"],
+            host=cfg["host"],
             port=int(cfg.get("port", 161)),
             community=cfg.get("community", "public"),
             description=cfg.get("description", ""),
@@ -738,7 +738,7 @@ class SNMPPoller:
         # ── built-in server metadata variables ───────────────────────────────
         specs["snmp_host"] = NodeSpec(
             opcua_type="String",
-            initial_value=self.ip,
+            initial_value=self.host,
             description="IP address of the SNMP device",
         )
         specs["snmp_port"] = NodeSpec(
@@ -934,7 +934,7 @@ class SNMPPoller:
 
         # ── server variables ──────────────────────────────────────────────────
         for name, opcua_type, value in [
-            ("snmp_host",             "String",  self.ip),
+            ("snmp_host",             "String",  self.host),
             ("snmp_port",             "UInt16",  self.port),
             ("snmp_polling_interval", "Double",  self.poll_interval),
         ]:
@@ -1051,13 +1051,13 @@ class SNMPPoller:
             ObjectType(ObjectIdentity(oid_cfg.oid)) for oid_cfg in self.oids
         ]
         log.debug("SNMP GET %s:%d — requesting %d OID(s): %s",
-                  self.ip, self.port, len(self.oids),
+                  self.host, self.port, len(self.oids),
                   ", ".join(o.oid for o in self.oids))
         # Re-use the engine and transport target created once; recreating them
         # on every call is heavyweight and leaks resources.
         if self._transport_target is None:
             self._transport_target = await UdpTransportTarget.create(
-                (self.ip, self.port), timeout=self.snmp_timeout, retries=self.snmp_retries
+                (self.host, self.port), timeout=self.snmp_timeout, retries=self.snmp_retries
             )
         error_indication, error_status, error_index, var_binds = await get_cmd(
             self._snmp_engine,
@@ -1069,7 +1069,7 @@ class SNMPPoller:
 
         # Transport / auth failure — device completely unreachable
         if error_indication:
-            log.debug("SNMP bulk GET %s: %s", self.ip, error_indication)
+            log.debug("SNMP bulk GET %s: %s", self.host, error_indication)
             return None
 
         # Agent-level error — one or more var-binds bad, rest may be ok
@@ -1080,7 +1080,7 @@ class SNMPPoller:
             )
             log.warning(
                 "SNMP GET %s: agent error '%s' at OID %s – skipping that OID",
-                self.ip, error_status.prettyPrint(), bad_oid,
+                self.host, error_status.prettyPrint(), bad_oid,
             )
             # SNMPv2c GET responses carry at most one error_index (RFC 3416
             # §4.2.1), so removing the single offending var-bind is sufficient.
@@ -1099,13 +1099,13 @@ class SNMPPoller:
             # they get marked BadNotSupported on the OPC UA side.
             if isinstance(value, (NoSuchObject, NoSuchInstance, EndOfMibView)):
                 log.debug("SNMP GET %s: OID %s returned %s – treating as unsupported",
-                          self.ip, oid_obj, type(value).__name__)
+                          self.host, oid_obj, type(value).__name__)
                 continue
             results[str(oid_obj)] = value
 
         if log.isEnabledFor(logging.DEBUG):
             log.debug("SNMP GET %s:%d — %d var-bind(s) received:",
-                      self.ip, self.port, len(results))
+                      self.host, self.port, len(results))
             for oid_key, raw_val in results.items():
                 log.debug("  %s = %s (%s)",
                           oid_key, raw_val.prettyPrint(), type(raw_val).__name__)
@@ -1134,9 +1134,9 @@ class SNMPPoller:
         poll is left to complete and will handle all staleness updates itself.
         """
         log.info("Poller started: %s  path=%s  interval=%.1fs  timeout=%.1fs  retries=%d",
-                 self.ip, self.opcua_path, self.poll_interval,
+                 self.host, self.opcua_path, self.poll_interval,
                  self.snmp_timeout, self.snmp_retries)
-        log.info("Waiting for device to respond: %s", self.ip)
+        log.info("Waiting for device to respond: %s", self.host)
 
         loop = asyncio.get_running_loop()
         origin = loop.time()
@@ -1144,10 +1144,10 @@ class SNMPPoller:
 
         while True:
             # ── Fire the poll, or skip if the previous one is still in flight ──
-            log.debug("Poller %s: starting slot %d", self.ip, cycle + 1)
+            log.debug("Poller %s: starting slot %d", self.host, cycle + 1)
             if self._poll_lock.locked():
                 log.warning("Poller %s: slot %d skipped — previous poll still in flight",
-                            self.ip, cycle + 1)
+                            self.host, cycle + 1)
                 poll_ran = False
                 was_offline = self._was_offline
             else:
@@ -1162,16 +1162,16 @@ class SNMPPoller:
             while origin + cycle * self.poll_interval <= now:
                 if not poll_ran or was_offline or self._was_offline:
                     log.debug("Poller %s: skipping overrun slot %d (device offline)",
-                              self.ip, cycle + 1)
+                              self.host, cycle + 1)
                 else:
                     log.warning("Poller %s: skipping overrun slot %d",
-                                self.ip, cycle + 1)
+                                self.host, cycle + 1)
                 cycle += 1
 
             # ── Sleep until the start of the next slot ────────────────────────
             sleep_for = origin + cycle * self.poll_interval - now
             log.debug("Poller %s: sleeping %.3fs until slot %d",
-                      self.ip, sleep_for, cycle + 1)
+                      self.host, sleep_for, cycle + 1)
             await asyncio.sleep(sleep_for)
 
     def _resolve_oid_key(self, oid_cfg: OIDConfig, results: Dict[str, Any]) -> Optional[str]:
@@ -1284,11 +1284,11 @@ class SNMPPoller:
         if results is None:
             # ── Device offline ────────────────────────────────────────────────
             if not self._was_offline:
-                log.warning("Device went offline: %s", self.ip)
+                log.warning("Device went offline: %s", self.host)
                 self._oid_key_cache.clear()
                 self._was_offline = True
 
-            log.debug("Device offline: %s", self.ip)
+            log.debug("Device offline: %s", self.host)
             for oid_cfg in self.oids:
                 entry = self._store.get(oid_cfg.opcua_name)
                 if entry is not None:
@@ -1315,7 +1315,7 @@ class SNMPPoller:
 
         # ── Device is responding ──────────────────────────────────────────────
         if self._was_offline:
-            log.info("Device came online: %s — resolving OID keys", self.ip)
+            log.info("Device came online: %s — resolving OID keys", self.host)
             self._oid_key_cache.clear()
             for oid_cfg in self.oids:
                 key = self._resolve_oid_key(oid_cfg, results)
@@ -1326,7 +1326,7 @@ class SNMPPoller:
                 else:
                     log.warning(
                         "OID not supported by device – marking BadNotSupported: "
-                        "%s on %s", oid_cfg.oid, self.ip,
+                        "%s on %s", oid_cfg.oid, self.host,
                     )
                     entry = self._store[oid_cfg.opcua_name]
                     entry.data_value = ua.DataValue(
@@ -1348,7 +1348,7 @@ class SNMPPoller:
             raw = results.get(key)
             if raw is None:
                 log.warning("Cached OID key no longer in response: %s on %s",
-                            key, self.ip)
+                            key, self.host)
                 continue
 
             py_val = _snmp_value_to_python(raw)
@@ -1485,10 +1485,10 @@ class OPCUAServer:
         if clash is not None:
             raise ValueError(
                 f"Duplicate opcua_path {poller.opcua_path!r}: "
-                f"already registered for {clash.ip}, cannot add {poller.ip}"
+                f"already registered for {clash.host}, cannot add {poller.host}"
             )
         self._pollers.append(poller)
-        log.info("Registered poller: %s → %s", poller.ip, poller.opcua_path)
+        log.info("Registered poller: %s → %s", poller.host, poller.opcua_path)
 
     # ── address space construction ────────────────────────────────────────────
 
@@ -1602,7 +1602,7 @@ class OPCUAServer:
                               exc_info=exc)
 
             tasks = [
-                asyncio.create_task(poller.run(), name=f"poller-{poller.ip}")
+                asyncio.create_task(poller.run(), name=f"poller-{poller.host}")
                 for poller in self._pollers
             ]
             for t in tasks:
@@ -1696,7 +1696,7 @@ def parse_args() -> argparse.Namespace:
 
 EXAMPLE_CONFIGS = [
     {
-        "ip":            "127.0.0.1",
+        "host":          "127.0.0.1",
         "port":          1161,
         "community":     "public",
         "description":   "Local test SNMP agent (net-snmp on localhost)",
@@ -1734,7 +1734,7 @@ EXAMPLE_CONFIGS = [
 
 def _expand_multi_ip(cfg: dict) -> List[dict]:
     """
-    If cfg["ip"] is a list, expand it into one config dict per address,
+    If cfg["host"] is a list, expand it into one config dict per address,
     substituting {instance} (zero-based index) into "opcua_path" and
     "description" via str.format_map().
 
@@ -1746,13 +1746,13 @@ def _expand_multi_ip(cfg: dict) -> List[dict]:
 
     Returns a list with a single element when "ip" is a plain string.
     """
-    ip = cfg["ip"]
+    ip = cfg["host"]
     if isinstance(ip, str):
         return [cfg]
 
     if not isinstance(ip, list) or not all(isinstance(a, str) for a in ip):
         sys.exit(
-            f'Config "ip" must be a string or a list of strings, '
+            f'Config "host" must be a string or a list of strings, '
             f'got: {ip!r}'
         )
 
@@ -1769,7 +1769,7 @@ def _expand_multi_ip(cfg: dict) -> List[dict]:
     for idx, address in enumerate(ip):
         fmt = {"instance": idx}
         instance_cfg = dict(cfg)
-        instance_cfg["ip"] = address
+        instance_cfg["host"] = address
         try:
             instance_cfg["opcua_path"] = opcua_path_template.format_map(fmt)
         except (KeyError, ValueError) as exc:
