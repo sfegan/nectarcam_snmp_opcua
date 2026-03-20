@@ -11,6 +11,8 @@ This project provides an OPC UA server that polls SNMP devices and exposes their
 - Supports multiple devices with individual configurations
 - Automatic handling of device online/offline states
 - Configurable polling intervals
+- Configurable SNMP timeout and retry settings
+- Lifetime management for OID staleness detection
 - Type-safe OPC UA variable creation with proper status codes
 - Authentication support for OPC UA server
 
@@ -70,6 +72,9 @@ Each device configuration is a JSON object with the following fields:
 - `description` (string, optional): Human-readable description of the device
 - `opcua_path` (string): Dot-separated OPC UA path relative to the root container (set by `--opcua-root`), e.g., `"Switch01"` or `"Switch.Monitoring"`. For multi-IP configurations, use `{instance}` for substitution.
 - `poll_interval` (number, optional): Polling interval in seconds (default: 10)
+- `snmp_timeout` (number, optional): SNMP request timeout in seconds (per attempt) (default: 2.0, or value from `--snmp-timeout`)
+- `snmp_retries` (integer, optional): Number of SNMP retries after the first attempt (default: 1, or value from `--snmp-retries`)
+- `default_lifetime` (number, optional): Default lifetime in seconds for OID variables that do not specify their own lifetime (default: 0, meaning never expire)
 - `oids` (array): List of OID configurations
 - `constants` (array, optional): List of constant variable configurations
 
@@ -90,6 +95,7 @@ Each constant in the `constants` array is a JSON object with:
 - `opcua_type` (string): OPC UA data type. Supported types: `Boolean`, `SByte`, `Byte`, `Int16`, `UInt16`, `Int32`, `UInt32`, `Int64`, `UInt64`, `Float`, `Double`, `String`, `ByteString`
 - `value` (any): The constant value to write (must be compatible with `opcua_type`)
 - `description` (string, optional): Description of the constant
+- `lifetime` (number, optional): Lifetime in seconds for this constant variable (default: 0, meaning never expire; not enforced for constants)
 
 Constants are fixed OPC UA variables whose values are written once at startup and never updated. They are useful for static metadata such as firmware version, serial number, or device model.
 
@@ -196,7 +202,7 @@ The bridge uses appropriate OPC UA status codes:
 - `Good`: Valid data from successful poll
 - `BadWaitingForInitialData`: Node created but no data received yet
 - `BadNotSupported`: OID not supported by device
-- `UncertainLastUsableValue`: Device offline, showing last known value
+- `UncertainLastUsableValue`: Device offline, showing last known value (within lifetime) or lifetime expired
 - `BadDataEncodingInvalid`: Type conversion failed
 
 ## Logging
