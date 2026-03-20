@@ -1060,40 +1060,49 @@ class SNMPPoller:
         log.info("Poller started: %s  path=%s  interval=%.1fs  timeout=%.1fs  retries=%d",
                  self.ip, self.opcua_path, self.poll_interval,
                  self.snmp_timeout, self.snmp_retries)
+        log.info("Waiting for device to respond: %s", self.ip)
 
         loop = asyncio.get_running_loop()
         origin = loop.time()
         cycle = 0
 
         while True:
-            now = loop.time()
-
-            # ── Skip any slots that have already elapsed ───────────────────────
-            # Calculate how many slots have passed since origin.  If the previous
-            # poll overran, advance cycle past all missed slots and log each one.
-            due_cycle = int((now - origin) / self.poll_interval)
-            while cycle < due_cycle:
-                log.warning("Poller %s: skipping overrun slot %d", self.ip, cycle + 1)
-                cycle += 1
-
-            # ── Sleep until the start of the current slot ─────────────────────
-            next_deadline = origin + cycle * self.poll_interval
-            sleep_for = next_deadline - now
-            if sleep_for > 0:
-                log.debug("Poller %s: sleeping %.3fs until slot %d",
-                          self.ip, sleep_for, cycle + 1)
-                await asyncio.sleep(sleep_for)
-
-            # ── Fire the poll, or skip if one is already in flight ────────────
+            # ── Fire the poll, or skip if the previous one is still in flight ──
             log.debug("Poller %s: starting slot %d", self.ip, cycle + 1)
             if self._poll_lock.locked():
                 log.warning("Poller %s: slot %d skipped — previous poll still in flight",
                             self.ip, cycle + 1)
+                poll_ran = False
+                was_offline = self._was_offline
             else:
+                was_offline = self._was_offline
                 async with self._poll_lock:
                     await self._poll_once()
+                poll_ran = True
 
+            # ── Advance past any slots that elapsed during the poll/skip ──────
+            # Overruns are expected (and logged at DEBUG) whenever the device was
+            # offline before or after the poll — covering going-offline, staying-
+            # offline, and coming-online transitions.  Only a poll where the device
+            # was online both before and after is a genuine unexpected overrun.
             cycle += 1
+            now = loop.time()
+            due_cycle = int((now - origin) / self.poll_interval)
+            while cycle < due_cycle:
+                if not poll_ran or was_offline or self._was_offline:
+                    log.debug("Poller %s: skipping overrun slot %d (device offline)",
+                              self.ip, cycle + 1)
+                else:
+                    log.warning("Poller %s: skipping overrun slot %d",
+                                self.ip, cycle + 1)
+                cycle += 1
+
+            # ── Sleep until the start of the next slot ────────────────────────
+            sleep_for = (origin + cycle * self.poll_interval) - loop.time()
+            if sleep_for > 0:
+                log.debug("Poller %s: sleeping %.3fs until slot %d",
+                          self.ip, sleep_for, cycle + 1)
+                await asyncio.sleep(sleep_for)
 
     def _resolve_oid_key(self, oid_cfg: OIDConfig, results: Dict[str, Any]) -> Optional[str]:
         """
