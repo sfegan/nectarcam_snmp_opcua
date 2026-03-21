@@ -449,8 +449,12 @@ class OIDConfig:
                 f"Unknown opcua_type '{self.opcua_type}' for OID {self.oid}. "
                 f"Valid types: {list(_UA_TYPE_MAP)}"
             )
+        # poll_every < 1 is meaningless — clamp silently to 1 (every cycle).
+        if self.poll_every < 1:
+            self.poll_every = 1
         # Resolve symbolic names (e.g. "SNMPv2-MIB::sysName.0") to dotted-decimal
-        # once at load time so the poll loop never has to deal with them.
+        # once at construction time so the poll loop and OID-key resolver always
+        # see numeric OIDs.
         self.oid = resolve_oid_name(self.oid)
 
 
@@ -708,6 +712,21 @@ class SNMPPoller:
                 f"poll_interval must be > 0, got {self.poll_interval!r} "
                 f"for poller {self.opcua_path!r}"
             )
+        if self.snmp_timeout <= 0:
+            raise ValueError(
+                f"snmp_timeout must be > 0, got {self.snmp_timeout!r} "
+                f"for poller {self.opcua_path!r}"
+            )
+        if self.snmp_retries < 0:
+            raise ValueError(
+                f"snmp_retries must be >= 0, got {self.snmp_retries!r} "
+                f"for poller {self.opcua_path!r}"
+            )
+        if self.default_lifetime < 0:
+            raise ValueError(
+                f"default_lifetime must be >= 0, got {self.default_lifetime!r} "
+                f"for poller {self.opcua_path!r}"
+            )
 
         # Create the SnmpEngine once and reuse it across all polls.
         # Recreating it on every call is heavyweight (dispatcher threads, etc.)
@@ -778,6 +797,50 @@ class SNMPPoller:
             constants=constants,
             default_lifetime=float(cfg.get("default_lifetime", 0.0)),
         )
+
+    def to_dict(self) -> dict:
+        """
+        Serialise this poller back to a configuration dictionary equivalent to
+        what would be loaded from a JSON file, with every field fully specified.
+
+        All values reflect the live dataclass state: symbolic OIDs have been
+        resolved to dotted-decimal, multi-IP instances are fully expanded (one
+        dict per host), and every optional field that was defaulted is present
+        with its resolved value.  The result can be written to JSON and reloaded
+        with any CLI options to reproduce identical behaviour.
+        """
+        return {
+            "host":             self.host,
+            "port":             self.port,
+            "community":        self.community,
+            "description":      self.description,
+            "opcua_path":       self.opcua_path,
+            "poll_interval":    self.poll_interval,
+            "snmp_timeout":     self.snmp_timeout,
+            "snmp_retries":     self.snmp_retries,
+            "default_lifetime": self.default_lifetime,
+            "oids": [
+                {
+                    "oid":         o.oid,
+                    "opcua_name":  o.opcua_name,
+                    "opcua_type":  o.opcua_type,
+                    "description": o.description,
+                    "lifetime":    o.lifetime,
+                    "poll_every":  o.poll_every,
+                }
+                for o in self.oids
+            ],
+            "constants": [
+                {
+                    "opcua_name":  c.opcua_name,
+                    "opcua_type":  c.opcua_type,
+                    "value":       c.value,
+                    "description": c.description,
+                    "lifetime":    c.lifetime,
+                }
+                for c in self.constants
+            ],
+        }
 
     # ── subclassing hooks ─────────────────────────────────────────────────────
 
@@ -1396,6 +1459,21 @@ class SNMPPoller:
                   self.host, self._polling_cycle, len(due_oids), len(self.oids),
                   " (force_full)" if force_full else "")
 
+        # ── Empty cycle: no OIDs due this cycle ───────────────────────────────
+        # Skip the GET entirely rather than sending a zero-OID request (whose
+        # behaviour is agent-dependent and likely wrong).  snmp_polling_age keeps
+        # ticking so OPC UA clients see time advancing; everything else is left
+        # untouched — we have no new information about the device this cycle.
+        if not due_oids:
+            now = time.monotonic()
+            last_ts = self._store["snmp_polling_timestamp"].timestamp
+            if last_ts is not None:
+                self._store["snmp_polling_age"].data_value = ua.DataValue(
+                    ua.Variant(now - last_ts, ua.VariantType.Double)
+                )
+            await self.write_variables()
+            return True
+
         results = await self._get_all_oids(due_oids)
 
         if results is None:
@@ -1862,11 +1940,35 @@ def parse_args() -> argparse.Namespace:
         ),
     )
     p.add_argument(
+        "--default-poll-interval",
+        type=float,
+        default=10.0,
+        metavar="SECONDS",
+        help=(
+            "Default SNMP poll interval in seconds applied to every device that "
+            "does not specify its own poll_interval in its JSON config."
+        ),
+    )
+    p.add_argument(
         "--publish-local-oids",
         action="store_true",
         default=False,
         help=(
             "Strip leading underscores from local (underscore-prefixed) OID names "            "so they are published as OPC UA variables instead of being kept "            "server-side only.  Intended for testing and diagnostics."
+        ),
+    )
+    p.add_argument(
+        "--dump-device-config",
+        metavar="FILE.json",
+        default=None,
+        help=(
+            "Write the fully-resolved device configuration to FILE.json just "
+            "before starting the OPC UA event loop, then continue running normally. "
+            "The output is reconstructed from the live SNMPPoller instances so "
+            "every field is present with its resolved value: symbolic OIDs are "
+            "in dotted-decimal, multi-IP entries are expanded, and all defaults "
+            "are filled in.  Reloading the file reproduces identical behaviour "
+            "regardless of CLI defaults."
         ),
     )
     return p.parse_args()
@@ -2083,14 +2185,26 @@ async def async_main() -> None:
 
     for cfg in configs:
         try:
-            # CLI --snmp-timeout / --snmp-retries act as fallback defaults;
-            # per-device JSON keys take precedence if present.
-            cfg.setdefault("snmp_timeout", args.snmp_timeout)
-            cfg.setdefault("snmp_retries", args.snmp_retries)
+            # CLI defaults act as fallbacks; per-device JSON keys take precedence.
+            cfg.setdefault("poll_interval", args.default_poll_interval)
+            cfg.setdefault("snmp_timeout",  args.snmp_timeout)
+            cfg.setdefault("snmp_retries",  args.snmp_retries)
             opcua_server.register(SNMPPoller.from_dict(cfg))
         except (ValueError, KeyError) as exc:
             sys.exit(f"Invalid device configuration for "
                      f"{cfg.get('opcua_path', cfg.get('ip', '?'))!r}: {exc}")
+
+    # ── optional config dump (written just before the event loop starts) ─────
+    if args.dump_device_config:
+        configs_out = [p.to_dict() for p in opcua_server._pollers]
+        payload = configs_out[0] if len(configs_out) == 1 else configs_out
+        try:
+            with open(args.dump_device_config, "w") as fh:
+                json.dump(payload, fh, indent=2, default=str)
+            log.info("Device config dumped to %s", args.dump_device_config)
+        except OSError as exc:
+            log.error("Could not write device config dump to %s: %s",
+                      args.dump_device_config, exc)
 
     await opcua_server.run()
 
