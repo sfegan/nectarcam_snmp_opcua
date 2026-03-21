@@ -10,7 +10,7 @@ This project provides an OPC UA server that polls SNMP devices and exposes their
 - Exposes OID values as typed OPC UA variables
 - Supports multiple devices with individual configurations
 - Automatic handling of device online/offline states
-- Configurable polling intervals
+- Configurable polling intervals, including per-OID sub-sampling via `poll_every`
 - Configurable SNMP timeout and retry settings
 - Lifetime management for OID staleness detection
 - Type-safe OPC UA variable creation with proper status codes
@@ -58,7 +58,9 @@ python snmp_asyncua_bridge.py \
 - `--log-file`: Optional log file path
 - `--snmp-timeout`: SNMP request timeout in seconds (per attempt) (default: 2.0). Can be overridden per device in JSON config.
 - `--snmp-retries`: Number of SNMP retries after the first attempt (default: 1). Can be overridden per device in JSON config.
-- `--device-config`: Path to JSON configuration file (can be specified multiple times)
+- `--default-poll-interval`: Default poll interval in seconds applied to every device that does not specify its own `poll_interval` in its JSON config (default: 10.0). Can be overridden per device.
+- `--device-config`: Path to JSON configuration file (can be specified multiple times).
+- `--dump-device-config`: Path to a JSON file to write the fully-resolved device configuration just before the event loop starts, then continue running normally. The output is reconstructed from the live poller instances so every field is present with its resolved value: symbolic OIDs are in dotted-decimal, multi-IP entries are fully expanded, and all defaults are filled in. Reloading the file reproduces identical behaviour regardless of CLI defaults.
 - `--publish-local-oids`: Strip leading underscores from local (underscore-prefixed) OID names so they are published as OPC UA variables instead of being kept server-side only. Intended for testing and diagnostics.
 
 ## Configuration
@@ -71,13 +73,13 @@ Each device configuration is a JSON object with the following fields:
 
 - `host` (string or array of strings): IP address(es) of the SNMP device(s). If an array, multiple identical devices are created with `{instance}` placeholder substitution.
 - `port` (integer, optional): SNMP port (default: 161)
-- `community` (string, optional): SNMP community string (default: "public")
+- `community` (string, optional): SNMP community string (default: `"public"`)
 - `description` (string, optional): Human-readable description of the device
 - `opcua_path` (string): Dot-separated OPC UA path relative to the root container (set by `--opcua-root`), e.g., `"Switch01"` or `"Switch.Monitoring"`. For multi-IP configurations, use `{instance}` for substitution.
-- `poll_interval` (number, optional): Polling interval in seconds (default: 10)
-- `snmp_timeout` (number, optional): SNMP request timeout in seconds (per attempt) (default: 2.0, or value from `--snmp-timeout`)
-- `snmp_retries` (integer, optional): Number of SNMP retries after the first attempt (default: 1, or value from `--snmp-retries`)
-- `default_lifetime` (number, optional): Default lifetime in seconds for OID variables that do not specify their own lifetime (default: 0, meaning never expire)
+- `poll_interval` (number, optional): Polling interval in seconds (default: value of `--default-poll-interval`, which defaults to 10.0)
+- `snmp_timeout` (number, optional): SNMP request timeout in seconds (per attempt) (default: value of `--snmp-timeout`)
+- `snmp_retries` (integer, optional): Number of SNMP retries after the first attempt (default: value of `--snmp-retries`)
+- `default_lifetime` (number, optional): Default lifetime in seconds for OID variables that do not specify their own `lifetime`. `0` means never expire (default: 0).
 - `oids` (array): List of OID configurations
 - `constants` (array, optional): List of constant variable configurations
 
@@ -86,9 +88,11 @@ Each device configuration is a JSON object with the following fields:
 Each OID in the `oids` array is a JSON object with:
 
 - `oid` (string): OID identifier, either in dotted-decimal notation (e.g., `"1.3.6.1.2.1.1.1.0"`) or symbolic name (e.g., `"SNMPv2-MIB::sysDescr.0"`). Symbolic names are automatically resolved to numeric form at startup.
-- `opcua_name` (string): Name of the OPC UA variable
-- `opcua_type` (string): OPC UA data type. Supported types: `Boolean`, `SByte`, `Byte`, `Int16`, `UInt16`, `Int32`, `UInt32`, `Int64`, `UInt64`, `Float`, `Double`, `String`, `ByteString`
-- `description` (string, optional): Description of the OID (default: "")
+- `opcua_name` (string): Name of the OPC UA variable. Names beginning with `_` are *local*: polled and stored internally but not published as OPC UA nodes (useful as inputs for derived variables in subclasses).
+- `opcua_type` (string): OPC UA data type. Supported types: `Boolean`, `SByte`, `Byte`, `Int16`, `UInt16`, `Int32`, `UInt32`, `Int64`, `UInt64`, `Float`, `Double`, `String`, `ByteString`, `DateTime`
+- `description` (string, optional): Description of the OID (default: `""`)
+- `lifetime` (number, optional): Lifetime in seconds for this variable. Any negative value means use the device-level `default_lifetime`. `0` means never expire. When the device is unreachable and the lifetime has elapsed the variable transitions from `UncertainLastUsableValue` to `BadNoCommunication`.
+- `poll_every` (integer, optional): Read this OID only every N poll cycles (default: 1, meaning every cycle). Values less than 1 are silently treated as 1. Use this to reduce SNMP traffic for slowly-changing values such as device names, firmware versions, or link status while keeping faster-changing values (counters, temperatures) at the full poll rate. See [Per-OID Poll Frequency](#per-oid-poll-frequency) below.
 
 ### Constants Configuration Structure
 
@@ -96,11 +100,11 @@ Each constant in the `constants` array is a JSON object with:
 
 - `opcua_name` (string): Name of the OPC UA variable
 - `opcua_type` (string): OPC UA data type. Supported types: `Boolean`, `SByte`, `Byte`, `Int16`, `UInt16`, `Int32`, `UInt32`, `Int64`, `UInt64`, `Float`, `Double`, `String`, `ByteString`, `DateTime`
-- `value` (any): The constant value to write (must be compatible with `opcua_type`)
+- `value` (any): The constant value to write (must be compatible with `opcua_type`). Use `null` to create a placeholder node that starts as `BadWaitingForInitialData` and is intended to be filled in by a subclass.
 - `description` (string, optional): Description of the constant
-- `lifetime` (number, optional): Lifetime in seconds for this constant variable (default: 0, meaning never expire; not enforced for constants)
+- `lifetime` (number, optional): Lifetime in seconds. Any negative value means use the device-level `default_lifetime` (for `null`-value derived constants) or `0` (for true constants). `0` means never expire.
 
-Constants are fixed OPC UA variables whose values are written once at startup and never updated. They are useful for static metadata such as firmware version, serial number, or device model.
+Constants are fixed OPC UA variables whose values are written once at startup and never updated by the poll loop. They are useful for static metadata such as firmware version, serial number, or device model.
 
 For multi-IP configurations, the `{instance}` placeholder can be used in `value` (if it is a string) and `description` fields for per-device customization.
 
@@ -115,13 +119,13 @@ Examples:
 
 Each device's `opcua_path` is appended to this root path, allowing for hierarchical organization.
 
-### Multi-IP Configurations
+## Multi-IP Configurations
 
-When `ip` is an array of strings, the bridge creates one SNMPPoller per address. The `{instance}` placeholder (zero-based index) can be used in `opcua_path` and `description` for customization:
+When `host` is an array of strings, the bridge creates one poller per address. The `{instance}` placeholder (zero-based index) can be used in `opcua_path` and `description` for customization:
 
 ```json
 {
-  "ip": ["192.168.1.10", "192.168.1.11", "192.168.1.12"],
+  "host": ["192.168.1.10", "192.168.1.11", "192.168.1.12"],
   "opcua_path": "Switch{instance:02d}",
   "description": "Distribution switch {instance}",
   "oids": [...]
@@ -132,19 +136,56 @@ This creates devices at `SNMPDevices/Switch00`, `SNMPDevices/Switch01`, `SNMPDev
 
 If `opcua_path` doesn't contain `{instance}`, a suffix `_{instance}` is automatically appended to avoid conflicts.
 
-### Example Configuration File
+## Per-OID Poll Frequency
+
+By default every OID is read on every poll cycle (`poll_every: 1`). Setting `poll_every: N` causes the OID to be included in the SNMP GET only every N cycles, reducing traffic for slowly-changing values.
 
 ```json
 {
-  "ip": "192.168.1.10",
+  "host": "192.168.1.10",
+  "opcua_path": "Switch01",
+  "poll_interval": 1,
+  "oids": [
+    {
+      "oid": "1.3.6.1.2.1.2.2.1.10.1",
+      "opcua_name": "ifInOctets",
+      "opcua_type": "UInt32",
+      "description": "Bytes received — read every cycle",
+      "poll_every": 1
+    },
+    {
+      "oid": "SNMPv2-MIB::sysDescr.0",
+      "opcua_name": "sysDescr",
+      "opcua_type": "String",
+      "description": "System description — read every 60 cycles (once per minute)",
+      "poll_every": 60
+    }
+  ]
+}
+```
+
+**Staleness behaviour with `poll_every > 1`:** only OIDs that were actually requested in a given cycle can be marked `UncertainLastUsableValue`. OIDs not due that cycle are left entirely untouched — their status remains `Good` from the last successful read until they are next polled.
+
+**Device going offline:** when the SNMP agent becomes unreachable, all OIDs are immediately marked stale (regardless of `poll_every`) and all per-OID schedules are reset so that every variable is re-read on the next successful cycle. The sub-sampling phase is reset from that point.
+
+**Cycles with no OIDs due:** if a combination of `poll_every` values results in a cycle where no OID is due, the SNMP GET is skipped entirely. `snmp_polling_age` continues to tick and is pushed to OPC UA; all other state is left unchanged.
+
+## Example Configuration File
+
+```json
+{
+  "host": "192.168.1.10",
   "description": "Main distribution switch, rack A",
   "opcua_path": "Switch.Monitoring",
+  "poll_interval": 5,
+  "default_lifetime": 30,
   "oids": [
     {
       "oid": "SNMPv2-MIB::sysDescr.0",
       "opcua_name": "sysDescr",
       "opcua_type": "String",
-      "description": "System description"
+      "description": "System description",
+      "poll_every": 12
     },
     {
       "oid": "SNMPv2-MIB::sysUpTime.0",
@@ -164,19 +205,19 @@ If `opcua_path` doesn't contain `{instance}`, a suffix `_{instance}` is automati
 }
 ```
 
-### Multiple Devices in One File
+## Multiple Devices in One File
 
 You can define multiple devices in a single JSON file as an array:
 
 ```json
 [
   {
-    "ip": "192.168.1.10",
+    "host": "192.168.1.10",
     "opcua_path": "Switch01",
     "oids": [...]
   },
   {
-    "ip": "192.168.1.11",
+    "host": "192.168.1.11",
     "opcua_path": "Switch02",
     "oids": [...]
   }
@@ -189,9 +230,14 @@ The bridge creates the following structure in the OPC UA server:
 
 - `Objects/{root_path}/` (configurable root container)
   - `{opcua_path}/` (device folder, can be multi-level)
-    - `host` (String): Device IP address
-    - `port` (UInt16): Device port
-    - `cls_state` (Byte): Online state (1 = online, 0 = offline)
+    - `snmp_host` (String): Device IP address
+    - `snmp_port` (UInt16): Device SNMP UDP port
+    - `snmp_polling_timestamp` (DateTime): Wall-clock time of the last successful poll
+    - `snmp_polling_age` (Double): Seconds since the last successful poll
+    - `snmp_polling_interval` (Double): Configured poll interval in seconds
+    - `snmp_polling_success_count` (UInt32): Cumulative count of successful polls
+    - `snmp_server_online` (Boolean): True when the SNMP agent is reachable
+    - `cls_state` (Byte): Bridge connection state (0 = offline, 1 = online)
     - `{opcua_name}`: Configured OID and constant variables
 
 For example, with `--opcua-root SNMPDevices` and `opcua_path: "Switch.Monitoring"`, the device variables would be under `Objects/SNMPDevices/Switch/Monitoring/`.
@@ -202,15 +248,16 @@ All variables are read-only. Device state and OID values are updated automatical
 
 The bridge uses appropriate OPC UA status codes:
 
-- `Good`: Valid data from successful poll
+- `Good`: Valid data from a successful poll
 - `BadWaitingForInitialData`: Node created but no data received yet
-- `BadNotSupported`: OID not supported by device
-- `UncertainLastUsableValue`: Device offline, showing last known value (within lifetime) or lifetime expired
+- `BadNotSupported`: OID not supported by the device
+- `UncertainLastUsableValue`: Device unreachable; showing last known value (within lifetime)
+- `BadNoCommunication`: Device unreachable and variable lifetime has expired
 - `BadDataEncodingInvalid`: Type conversion failed
 
 ## Logging
 
-Logs include polling activity, device state changes, and errors. Use `--log-level DEBUG` for detailed SNMP transaction logs.
+Logs include polling activity, device state changes, and errors. Use `--log-level DEBUG` for detailed per-cycle SNMP transaction logs including which OIDs were requested each cycle.
 
 ## License
 
