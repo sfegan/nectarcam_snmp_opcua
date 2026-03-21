@@ -33,12 +33,14 @@ Each SNMPPoller is built from a dict like:
                 "opcua_name":  "sysDescr",
                 "opcua_type":  "String",
                 "description": "System description",   # optional, defaults to ""
+                "poll_every":  5,                      # optional; read every 5 cycles (default 1)
             },
             {
                 "oid":         "SNMPv2-MIB::sysUpTime.0",   # symbolic name also accepted
                 "opcua_name":  "sysUpTime",
                 "opcua_type":  "UInt32",
                 "description": "System uptime in hundredths of a second",
+                                                       # poll_every defaults to 1 (every cycle)
             },
         ],
         "constants": [                          # optional; written once at startup
@@ -433,7 +435,8 @@ class OIDConfig:
                               # "local" — polled and stored but not published to OPC UA.
     opcua_type: str           # one of the keys in _UA_TYPE_MAP
     description: str = ""
-    lifetime: float = -1.0  # seconds; <0 means "use device default"; 0 means never expire
+    lifetime: float = -1.0   # seconds; <0 means "use device default"; 0 means never expire
+    poll_every: int = 1       # read this OID every N PLL cycles (1 = every cycle)
 
     @property
     def is_local(self) -> bool:
@@ -546,12 +549,19 @@ class StoreEntry:
                     so write_variables can inspect the type if needed.
     is_local        True for OID variables whose opcua_name starts with '_'.
                     These are stored but no OPC UA node is created for them.
+    next_cycle      The PLL cycle number on which this variable is next due to be
+                    polled.  Initialised to 0 so all variables fire on cycle 1.
+                    Advanced by poll_every on each successful read (scheduled polls
+                    only — forced full-reloads never advance next_cycle).
+                    Reset to _polling_cycle when the device goes offline so all
+                    variables are re-read on the next successful cycle.
     """
     data_value:       ua.DataValue
     timestamp:        Optional[float]   # time.monotonic(), or None if never read
     lifetime: float             # seconds; 0 = never expire
     opcua_type:       str
     is_local:         bool = False
+    next_cycle:       int  = 0        # PLL cycle on which this variable is next due
 
 
 @dataclass
@@ -617,6 +627,30 @@ class SNMPPoller:
     skipped.  If the previous poll is still in flight when the next slot fires
     (possible when ``snmp_timeout * (snmp_retries + 1) > poll_interval``), that
     slot is skipped entirely with a warning — no store updates, no OPC UA writes.
+
+    Per-variable poll frequency
+    ---------------------------
+    Each OID may specify ``poll_every`` (default 1) to be read only every N PLL
+    cycles.  The store entry for each OID tracks ``next_cycle`` — the cycle
+    number on which it is next due.  On each scheduled poll only the due OIDs are
+    included in the SNMP GET; non-due OIDs are left entirely untouched (no
+    staleness is applied).  On a successful read ``next_cycle`` is advanced by
+    ``poll_every``.  When the device goes offline ``next_cycle`` is reset to
+    ``_polling_cycle`` for all OIDs so they all fire together on the next
+    successful cycle (PLL phasing for slow-polled OIDs resets at that point).
+
+    Staleness (``_apply_staleness``) is called only for OIDs that were actually
+    requested this cycle and did not respond, or for all OIDs when the device is
+    offline.  OIDs that were simply not due are never touched.
+
+    On-demand full reload
+    ---------------------
+    ``force_reload()`` acquires ``_poll_lock`` (waiting for any in-flight
+    scheduled poll to finish) then issues a GET for *all* OIDs regardless of
+    ``next_cycle``.  ``next_cycle`` is never advanced and ``_polling_cycle`` is
+    never changed, so the PLL schedule is undisturbed.  Returns True if the
+    device responded.  Intended for use by subclass OPC UA method handlers that
+    change hardware state via a side channel and need fresh values immediately.
     """
 
     # ── config ────────────────────────────────────────────────────────────────
@@ -643,7 +677,13 @@ class SNMPPoller:
     # Lock that prevents concurrent polls.  If a poll cycle starts while the
     # previous one is still awaiting its SNMP response, the new cycle is skipped
     # entirely and the in-flight poll is left to complete normally.
+    # force_reload() also acquires this lock and waits — it never skips.
     _poll_lock: asyncio.Lock = field(default_factory=asyncio.Lock, init=False, repr=False)
+    # PLL cycle number of the last poll actually *launched* by run().
+    # Updated only when a poll fires, not when a slot is skipped.
+    # Read by _poll_once() to decide which OIDs are due and to reset
+    # next_cycle values when the device goes offline.
+    _polling_cycle: int = field(default=0, init=False, repr=False)
     # The asyncua Object node for this device — available to subclasses from
     # on_address_space_ready() onwards.
     _device_node: Any = field(default=None, init=False, repr=False)
@@ -1024,6 +1064,7 @@ class SNMPPoller:
                 lifetime=effective_lifetime,
                 opcua_type=oid_cfg.opcua_type,
                 is_local=oid_cfg.is_local,
+                next_cycle=0,   # due on cycle 1
             )
 
         # ── constants ─────────────────────────────────────────────────────────
@@ -1057,9 +1098,19 @@ class SNMPPoller:
 
     # ── SNMP helpers ──────────────────────────────────────────────────────────
 
-    async def _get_all_oids(self) -> Optional[Dict[str, Any]]:
+    async def _get_all_oids(
+        self,
+        oid_list: List[OIDConfig],
+    ) -> Optional[Dict[str, Any]]:
         """
-        Fetch all configured OIDs in a single bulk GET request.
+        Fetch the given list of OIDs in a single bulk GET request.
+
+        Parameters
+        ----------
+        oid_list : List[OIDConfig]
+            The OIDs to request.  Callers build this list from the full
+            ``self.oids`` (force_full) or from the subset that is due this
+            cycle (scheduled poll).
 
         Returns a dict mapping oid_str -> raw_value for every OID that
         responded successfully, or None if the device was unreachable entirely
@@ -1069,11 +1120,11 @@ class SNMPPoller:
         logged as warnings; the remaining results are still returned.
         """
         object_types = [
-            ObjectType(ObjectIdentity(oid_cfg.oid)) for oid_cfg in self.oids
+            ObjectType(ObjectIdentity(oid_cfg.oid)) for oid_cfg in oid_list
         ]
         log.debug("SNMP GET %s:%d — requesting %d OID(s): %s",
-                  self.host, self.port, len(self.oids),
-                  ", ".join(o.oid for o in self.oids))
+                  self.host, self.port, len(oid_list),
+                  ", ".join(o.oid for o in oid_list))
         # Re-use the engine and transport target created once; recreating them
         # on every call is heavyweight and leaks resources.
         if self._transport_target is None:
@@ -1173,6 +1224,10 @@ class SNMPPoller:
                 was_offline = self._was_offline
             else:
                 was_offline = self._was_offline
+                # Update _polling_cycle *before* calling _poll_once so that
+                # next_cycle comparisons inside the poll see the correct value.
+                # _polling_cycle is only advanced here — never on a skipped slot.
+                self._polling_cycle = cycle + 1
                 async with self._poll_lock:
                     await self._poll_once()
                 poll_ran = True
@@ -1275,32 +1330,73 @@ class SNMPPoller:
                 StatusCode_=_uncertain,
             )
 
-    async def _poll_once(self) -> None:
+    async def _poll_once(self, force_full: bool = False) -> bool:
         """
-        Fetch all configured OIDs in one bulk GET, update the internal data
-        store for every variable, then call write_variables() to push the
-        entire store to OPC UA.
+        Fetch OIDs from the device, update the internal data store, then call
+        write_variables() to push the entire store to OPC UA.
+
+        Parameters
+        ----------
+        force_full : bool
+            When True, request *all* configured OIDs regardless of their
+            ``next_cycle`` schedule.  ``next_cycle`` is never advanced and
+            ``_polling_cycle`` is never changed, so the PLL schedule is
+            undisturbed.  Intended for use by ``force_reload()`` only.
+            When False (default), only OIDs whose ``next_cycle <=
+            _polling_cycle`` are requested; ``next_cycle`` is advanced for
+            each OID that responds successfully.
+
+        Returns
+        -------
+        bool
+            True if the device responded (results were received); False if the
+            device was unreachable this cycle.
 
         Responsibilities
         ----------------
-        • Update snmp_polling_timestamp and snmp_polling_age only on a successful poll,
-          using the initiation time (captured before the GET) so they reflect
-          when the request was sent rather than when the response arrived.
+        • Build the per-cycle OID request list from due variables (or all OIDs
+          when force_full=True).
+        • Update snmp_polling_timestamp and snmp_polling_age only on a
+          successful poll, using the initiation time so they reflect when the
+          request was sent rather than when the response arrived.
         • On a successful response: update store entries for every OID that
-          replied, resolve and cache OID keys on the first post-offline cycle.
-        • On a failed response (device offline): apply staleness / lifetime
-          expiry to each OID store entry via _apply_staleness().
+          replied; resolve and cache OID keys on the first post-offline cycle;
+          advance next_cycle for each responding OID (scheduled polls only).
+        • On a failed response (device offline): reset next_cycle to
+          _polling_cycle for all OIDs (so they all fire on the next successful
+          cycle), then apply staleness to all OIDs immediately.
+        • Staleness (_apply_staleness) is called only for OIDs that were
+          requested this cycle and did not respond (online path), or for all
+          OIDs (offline path).  OIDs not due this cycle are never touched.
         • Update cls_state (1 = online, 0 = offline) in the store.
         • Call write_variables() once at the end of every cycle.
 
         OID key resolution is cached after the first successful poll and
         cleared when the device goes offline so keys are re-resolved on
         recovery.
+
+        Locking
+        -------
+        Does NOT acquire _poll_lock.  Callers (run() and force_reload()) are
+        responsible for holding the lock around this call.
         """
         now = time.monotonic()
         wall_now = datetime.datetime.now(datetime.timezone.utc)
 
-        results = await self._get_all_oids()
+        # ── Build the set of OIDs to request this cycle ───────────────────────
+        if force_full:
+            due_oids = self.oids
+        else:
+            due_oids = [
+                oid_cfg for oid_cfg in self.oids
+                if self._store[oid_cfg.opcua_name].next_cycle <= self._polling_cycle
+            ]
+
+        log.debug("Poller %s: cycle %d — requesting %d/%d OID(s)%s",
+                  self.host, self._polling_cycle, len(due_oids), len(self.oids),
+                  " (force_full)" if force_full else "")
+
+        results = await self._get_all_oids(due_oids)
 
         if results is None:
             # ── Device offline ────────────────────────────────────────────────
@@ -1310,6 +1406,17 @@ class SNMPPoller:
                 self._was_offline = True
 
             log.debug("Device offline: %s", self.host)
+
+            # Reset next_cycle for all OIDs to _polling_cycle so they all fire
+            # together on the next successful cycle.  PLL phasing for slow-polled
+            # OIDs resets at this point — this is intentional.
+            for oid_cfg in self.oids:
+                entry = self._store.get(oid_cfg.opcua_name)
+                if entry is not None:
+                    entry.next_cycle = self._polling_cycle
+
+            # Apply staleness to all OIDs immediately — we don't know the state
+            # of any variable when the device is unreachable.
             for oid_cfg in self.oids:
                 entry = self._store.get(oid_cfg.opcua_name)
                 if entry is not None:
@@ -1332,7 +1439,7 @@ class SNMPPoller:
                 )
 
             await self.write_variables()
-            return
+            return False
 
         # ── Device is responding ──────────────────────────────────────────────
         if self._was_offline:
@@ -1361,7 +1468,7 @@ class SNMPPoller:
 
         # ── Update store entries for OIDs present in the response ─────────────
         responded: set[str] = set()
-        for oid_cfg in self.oids:
+        for oid_cfg in due_oids:
             key = self._oid_key_cache.get(oid_cfg.opcua_name)
             if key is None:
                 continue    # marked BadNotSupported on coming online
@@ -1386,18 +1493,23 @@ class SNMPPoller:
             entry.timestamp = now
             responded.add(oid_cfg.opcua_name)
 
-        # ── Apply staleness to OIDs that did not respond this cycle ───────────
-        for oid_cfg in self.oids:
-            if oid_cfg.opcua_name not in responded \
-                    and self._oid_key_cache.get(oid_cfg.opcua_name) is not None:
+            # Advance next_cycle for scheduled polls only — force_full never
+            # advances next_cycle so the PLL schedule is undisturbed.
+            if not force_full:
+                entry.next_cycle = self._polling_cycle + oid_cfg.poll_every
+
+        # ── Apply staleness to due OIDs that did not respond this cycle ───────
+        # Only due_oids are candidates — non-due OIDs are left entirely untouched.
+        for oid_cfg in due_oids:
+            if oid_cfg.opcua_name not in responded                     and self._oid_key_cache.get(oid_cfg.opcua_name) is not None:
                 entry = self._store.get(oid_cfg.opcua_name)
                 if entry is not None:
                     self._apply_staleness(oid_cfg.opcua_name, entry, now)
 
-        # ── Update snmp_polling_timestamp and snmp_polling_age on success ───────────────
+        # ── Update snmp_polling_timestamp and snmp_polling_age on success ─────
         # Stamped with the initiation time of this cycle (now/wall_now), so
-        # snmp_polling_age resets to ~0.0 on success and snmp_polling_timestamp reflects
-        # when the request was sent rather than when the response arrived.
+        # snmp_polling_age resets to ~0.0 on success and snmp_polling_timestamp
+        # reflects when the request was sent rather than when the response arrived.
         self._store["snmp_polling_timestamp"].data_value = ua.DataValue(
             ua.Variant(wall_now, ua.VariantType.DateTime)
         )
@@ -1419,7 +1531,48 @@ class SNMPPoller:
             ua.Variant((prev + 1) & 0xFFFFFFFF, ua.VariantType.UInt32)
         )
         await self.write_variables()
+        return True
 
+    async def force_reload(self) -> bool:
+        """
+        Issue an immediate full SNMP GET for all configured OIDs and update the
+        OPC UA address space, regardless of each OID's scheduled ``next_cycle``.
+
+        Intended for subclass OPC UA method handlers that change hardware state
+        via a side channel (e.g. a serial or Ethernet command) and need fresh
+        values immediately after the change is applied.
+
+        Behaviour
+        ---------
+        • Acquires ``_poll_lock``, waiting for any in-flight scheduled poll to
+          finish first.  The poll is never silently dropped — if a scheduled poll
+          was in progress just before the hardware command was sent, this method
+          waits for it to complete and then fires a fresh GET so the post-command
+          state is captured.
+        • Requests all OIDs (``force_full=True``).
+        • Never advances ``next_cycle`` for any variable.
+        • Never modifies ``_polling_cycle``.
+        • If the scheduled PLL slot fires while this reload is holding the lock,
+          that slot is skipped (the normal skip-if-busy path in ``run()``).
+
+        Returns
+        -------
+        bool
+            True if the device responded; False if it was unreachable.
+
+        Example usage in a subclass OPC UA method::
+
+            @ua_method(...)
+            async def apply_setting(self, new_value):
+                await self._send_command(new_value)   # side-channel write
+                ok = await self.force_reload()
+                if not ok:
+                    raise ua.UaError("Device did not respond after applying setting")
+        """
+        log.debug("force_reload: %s — waiting for lock", self.host)
+        async with self._poll_lock:
+            log.debug("force_reload: %s — lock acquired, issuing full GET", self.host)
+            return await self._poll_once(force_full=True)
 
 # ─────────────────────────────────────────────────────────────────────────────
 # Simple username/password validator for asyncua
