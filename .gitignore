@@ -180,3 +180,4 @@ cython_debug/
 .cursorignore
 .cursorindexingignore
 device_x-cisco.in2p3.fr.json
+server_config.json
