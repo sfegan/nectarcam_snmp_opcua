@@ -10,26 +10,29 @@
             "oid":         "SNMPv2-MIB::sysDescr.0",
             "opcua_name":  "sysDescr",
             "opcua_type":  "String",
-            "description": "System description"
+            "description": "System description",
+            "poll_every":  12
         },
         {
             "oid":         "SNMPv2-MIB::sysUpTime.0",
             "opcua_name":  "sysUpTime",
-            "opcua_type":  "UInt32",
-            "description": "System uptime (hundredths of a second)",
+            "opcua_type":  "String",
+            "description": "System uptime",
             "lifetime":    60
         },
         {
             "oid":         "SNMPv2-MIB::sysName.0",
             "opcua_name":  "sysName",
             "opcua_type":  "String",
-            "description": "Administratively assigned system name"
+            "description": "Administratively assigned system name",
+            "poll_every":  12
         },
         {
             "oid":         "SNMPv2-MIB::sysLocation.0",
             "opcua_name":  "sysLocation",
             "opcua_type":  "String",
-            "description": "Physical location of the system"
+            "description": "Physical location of the system",
+            "poll_every":  12
         }
     ]
 }
