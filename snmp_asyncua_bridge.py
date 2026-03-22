@@ -1217,6 +1217,7 @@ class SNMPPoller:
             self._transport_target,
             ContextData(),
             *object_types,
+            lookupMib=False,
         )
 
         # Transport / auth failure — device completely unreachable
