@@ -27,6 +27,10 @@ Each SNMPPoller is built from a dict like:
         "snmp_timeout":  2.0,           # optional, defaults to 2.0 (seconds per attempt)
         "snmp_retries":  1,             # optional, defaults to 1
         "default_lifetime": 30, # optional; per-OID default for lifetime (0 = never expire)
+        "oids_per_get":  1,     # optional; max OIDs per SNMP GET request:
+                                #   -1 (default) → use the server-wide default (--default-oids-per-get)
+                                #    0            → unlimited (all due OIDs in one request)
+                                #   >0            → at most this many OIDs per GET (batched)
         "oids": [
             {
                 "oid":         "1.3.6.1.2.1.1.1.0",   # sysDescr  (dotted-decimal)
@@ -671,6 +675,21 @@ class SNMPPoller:
     # Default lifetime (seconds) for OID variables that do not specify their own.
     # 0 means variables with lifetime=-1 never expire.
     default_lifetime: float = 0.0
+    # Maximum number of OIDs sent in a single SNMP GET request.
+    #  -1  (default) → resolved at registration time to the server-wide default
+    #                   (OPCUAServer.default_oids_per_get, set via --default-oids-per-get)
+    #   0             → unlimited — all due OIDs are sent in one GET
+    #  >0             → at most this many OIDs per GET; the list is split into
+    #                   sequential batches and results are merged before processing
+    #
+    # Unlike other sentinel fields (e.g. OIDConfig.lifetime, which is resolved
+    # lazily at _init_store() time against the device's own default_lifetime),
+    # this sentinel is resolved eagerly in OPCUAServer.register() because the
+    # server default is external to the poller and not available at construction
+    # time.  After registration the field always holds a concrete value (>= 0)
+    # and to_dict() serialises that resolved value so that dumped configs are
+    # fully self-contained and CLI-independent.
+    oids_per_get: int = -1
 
     # ── runtime state (set by OPCUAServer during registration) ───────────────
     _node_map: Dict[str, Any] = field(default_factory=dict, init=False, repr=False)
@@ -796,6 +815,7 @@ class SNMPPoller:
             oids=oids,
             constants=constants,
             default_lifetime=float(cfg.get("default_lifetime", 0.0)),
+            oids_per_get=int(cfg.get("oids_per_get", -1)),
         )
 
     def to_dict(self) -> dict:
@@ -819,6 +839,7 @@ class SNMPPoller:
             "snmp_timeout":     self.snmp_timeout,
             "snmp_retries":     self.snmp_retries,
             "default_lifetime": self.default_lifetime,
+            "oids_per_get":     self.oids_per_get,
             "oids": [
                 {
                     "oid":         o.oid,
@@ -1161,26 +1182,22 @@ class SNMPPoller:
 
     # ── SNMP helpers ──────────────────────────────────────────────────────────
 
-    async def _get_all_oids(
+    async def _get_one_chunk(
         self,
         oid_list: List[OIDConfig],
     ) -> Optional[Dict[str, Any]]:
         """
-        Fetch the given list of OIDs in a single bulk GET request.
+        Fetch exactly the OIDs in *oid_list* in a single SNMP GET request.
 
-        Parameters
-        ----------
-        oid_list : List[OIDConfig]
-            The OIDs to request.  Callers build this list from the full
-            ``self.oids`` (force_full) or from the subset that is due this
-            cycle (scheduled poll).
+        Returns a dict mapping oid_str -> raw_value for every OID that responded
+        successfully, or None if the device was unreachable (error_indication set
+        before any var-bind was returned).
 
-        Returns a dict mapping oid_str -> raw_value for every OID that
-        responded successfully, or None if the device was unreachable entirely
-        (error_indication set before any var-bind was returned).
+        Individual OIDs that the agent reports an error for are skipped and logged
+        as warnings; the remaining results are still returned.
 
-        Individual OIDs that the agent reports an error for are skipped and
-        logged as warnings; the remaining results are still returned.
+        This is the low-level transport primitive.  Callers should normally use
+        _get_all_oids(), which handles batching according to oids_per_get.
         """
         object_types = [
             ObjectType(ObjectIdentity(oid_cfg.oid)) for oid_cfg in oid_list
@@ -1204,7 +1221,7 @@ class SNMPPoller:
 
         # Transport / auth failure — device completely unreachable
         if error_indication:
-            log.debug("SNMP bulk GET %s: %s", self.host, error_indication)
+            log.debug("SNMP GET %s: %s", self.host, error_indication)
             return None
 
         # Agent-level error — one or more var-binds bad, rest may be ok
@@ -1246,6 +1263,71 @@ class SNMPPoller:
                           oid_key, raw_val.prettyPrint(), type(raw_val).__name__)
 
         return results
+
+    async def _get_all_oids(
+        self,
+        oid_list: List[OIDConfig],
+        effective_limit: int,
+    ) -> Optional[Dict[str, Any]]:
+        """
+        Fetch the given list of OIDs, splitting them into sequential batches
+        when *effective_limit* is non-zero.
+
+        Parameters
+        ----------
+        oid_list : List[OIDConfig]
+            The OIDs to request.  Callers build this list from the full
+            ``self.oids`` (force_full) or from the subset that is due this
+            cycle (scheduled poll).
+        effective_limit : int
+            Maximum number of OIDs per individual GET request.
+            0  → send all OIDs in a single request (unlimited).
+            >0 → split *oid_list* into chunks of at most this size; each chunk
+                 is sent as a separate sequential GET and the results are merged.
+
+        Returns a dict mapping oid_str -> raw_value for every OID that
+        responded successfully across all batches, or None if the device was
+        unreachable (i.e. _get_one_chunk returned None for any batch — the
+        remaining batches are not sent).
+        """
+        if effective_limit == 0 or len(oid_list) <= effective_limit:
+            # Common fast path: everything fits in one request.
+            return await self._get_one_chunk(oid_list)
+
+        # Batched path: split into chunks and send sequentially.
+        n_chunks = (len(oid_list) + effective_limit - 1) // effective_limit
+        log.debug(
+            "SNMP GET %s: splitting %d OID(s) into %d chunk(s) of ≤%d (oids_per_get=%d)",
+            self.host, len(oid_list), n_chunks, effective_limit, effective_limit,
+        )
+        merged: Dict[str, Any] = {}
+        for chunk_idx in range(n_chunks):
+            start = chunk_idx * effective_limit
+            chunk = oid_list[start : start + effective_limit]
+            log.debug("SNMP GET %s: sending chunk %d/%d (%d OID(s))",
+                      self.host, chunk_idx + 1, n_chunks, len(chunk))
+            partial = await self._get_one_chunk(chunk)
+            if partial is None:
+                # Device stopped responding mid-batch.  Discard any results from
+                # earlier chunks and return None so _poll_once treats the whole
+                # cycle as a failure — consistent with the single-GET behaviour
+                # where a transport failure always discards the entire cycle.
+                # A warning is raised only when earlier chunks had succeeded, as
+                # that pattern (responded then stopped) is worth flagging.
+                if chunk_idx > 0:
+                    log.warning(
+                        "SNMP GET %s: chunk %d/%d failed after %d successful chunk(s)"
+                        " — discarding partial results and treating cycle as offline",
+                        self.host, chunk_idx + 1, n_chunks, chunk_idx,
+                    )
+                else:
+                    log.debug("SNMP GET %s: chunk %d/%d failed — aborting batch",
+                              self.host, chunk_idx + 1, n_chunks)
+                return None
+            merged.update(partial)
+        log.debug("SNMP GET %s: batch complete — %d var-bind(s) total",
+                  self.host, len(merged))
+        return merged
 
     # ── polling loop ──────────────────────────────────────────────────────────
 
@@ -1474,7 +1556,7 @@ class SNMPPoller:
             await self.write_variables()
             return True
 
-        results = await self._get_all_oids(due_oids)
+        results = await self._get_all_oids(due_oids, self.oids_per_get)
 
         if results is None:
             # ── Device offline ────────────────────────────────────────────────
@@ -1718,6 +1800,7 @@ class OPCUAServer:
         root_path: str = "SNMPDevices",
         user: Optional[str] = None,
         password: Optional[str] = None,
+        default_oids_per_get: int = 0,
     ):
         self.endpoint = endpoint
         self.namespace = namespace
@@ -1728,6 +1811,14 @@ class OPCUAServer:
         self.user = user
         self.password = password
         self._pollers: List[SNMPPoller] = []
+        # Server-wide default: maximum OIDs per SNMP GET (0 = unlimited).
+        # Used for pollers whose oids_per_get is -1 (inherit server default).
+        if default_oids_per_get < 0:
+            raise ValueError(
+                f"OPCUAServer default_oids_per_get must be >= 0, "
+                f"got {default_oids_per_get!r}"
+            )
+        self.default_oids_per_get: int = default_oids_per_get
 
     def register(self, poller: SNMPPoller) -> None:
         """Register an SNMPPoller with this server."""
@@ -1739,8 +1830,19 @@ class OPCUAServer:
                 f"Duplicate opcua_path {poller.opcua_path!r}: "
                 f"already registered for {clash.host}, cannot add {poller.host}"
             )
+        # Resolve the per-poller oids_per_get sentinel (-1 = inherit server
+        # default) by overwriting the field with the concrete value.  From this
+        # point on oids_per_get is always >= 0 and to_dict() serialises the
+        # resolved value, making dumped configs CLI-independent.
+        if poller.oids_per_get < 0:
+            poller.oids_per_get = self.default_oids_per_get
         self._pollers.append(poller)
-        log.info("Registered poller: %s → %s", poller.host, poller.opcua_path)
+        limit_desc = (
+            "unlimited" if poller.oids_per_get == 0
+            else f"{poller.oids_per_get} OID(s)/GET"
+        )
+        log.info("Registered poller: %s → %s  (oids_per_get: %s)",
+                 poller.host, poller.opcua_path, limit_desc)
 
     # ── address space construction ────────────────────────────────────────────
 
@@ -1958,6 +2060,21 @@ def parse_args() -> argparse.Namespace:
         ),
     )
     p.add_argument(
+        "--default-oids-per-get",
+        type=int,
+        default=0,
+        metavar="N",
+        help=(
+            "Server-wide default for the maximum number of OIDs sent in a single "
+            "SNMP GET request. 0 (default) means unlimited — all due OIDs are "
+            "fetched in one request. A positive value splits the OID list into "
+            "sequential batches of at most N, which is required by devices that "
+            "reject multi-OID GETs. Can be overridden per device with "
+            "\"oids_per_get\" in the JSON config (use -1 there to inherit this "
+            "server default)."
+        ),
+    )
+    p.add_argument(
         "--dump-device-config",
         metavar="FILE.json",
         default=None,
@@ -2172,6 +2289,7 @@ async def async_main() -> None:
         root_path=args.opcua_root,
         user=user,
         password=password,
+        default_oids_per_get=args.default_oids_per_get,
     )
     root_display = args.opcua_root if args.opcua_root else "(none — devices under Objects/)"
     log.info("OPC UA root path: %s", root_display)
