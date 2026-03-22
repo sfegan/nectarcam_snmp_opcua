@@ -12,6 +12,7 @@ This project provides an OPC UA server that polls SNMP devices and exposes their
 - Automatic handling of device online/offline states
 - Configurable polling intervals, including per-OID sub-sampling via `poll_every`
 - Configurable SNMP timeout and retry settings
+- Configurable maximum OIDs per GET request, for devices that reject multi-OID GETs
 - Lifetime management for OID staleness detection
 - Type-safe OPC UA variable creation with proper status codes
 - Authentication support for OPC UA server
@@ -59,6 +60,7 @@ python snmp_asyncua_bridge.py \
 - `--snmp-timeout`: SNMP request timeout in seconds (per attempt) (default: 2.0). Can be overridden per device in JSON config.
 - `--snmp-retries`: Number of SNMP retries after the first attempt (default: 1). Can be overridden per device in JSON config.
 - `--default-poll-interval`: Default poll interval in seconds applied to every device that does not specify its own `poll_interval` in its JSON config (default: 10.0). Can be overridden per device.
+- `--default-oids-per-get`: Server-wide default for the maximum number of OIDs sent in a single SNMP GET request (default: 0 = unlimited). A positive value causes the OID list to be split into sequential batches of at most that size, which is required by devices that reject multi-OID GETs. Can be overridden per device with `oids_per_get` in the JSON config.
 - `--device-config`: Path to JSON configuration file (can be specified multiple times).
 - `--dump-device-config`: Path to a JSON file to write the fully-resolved device configuration just before the event loop starts, then continue running normally. The output is reconstructed from the live poller instances so every field is present with its resolved value: symbolic OIDs are in dotted-decimal, multi-IP entries are fully expanded, and all defaults are filled in. Reloading the file reproduces identical behaviour regardless of CLI defaults.
 - `--publish-local-oids`: Strip leading underscores from local (underscore-prefixed) OID names so they are published as OPC UA variables instead of being kept server-side only. Intended for testing and diagnostics.
@@ -80,6 +82,7 @@ Each device configuration is a JSON object with the following fields:
 - `snmp_timeout` (number, optional): SNMP request timeout in seconds (per attempt) (default: value of `--snmp-timeout`)
 - `snmp_retries` (integer, optional): Number of SNMP retries after the first attempt (default: value of `--snmp-retries`)
 - `default_lifetime` (number, optional): Default lifetime in seconds for OID variables that do not specify their own `lifetime`. `0` means never expire (default: 0).
+- `oids_per_get` (integer, optional): Maximum number of OIDs to include in a single SNMP GET request for this device. `-1` (default) inherits the server-wide `--default-oids-per-get` value. `0` means unlimited (all due OIDs in one request). A positive value splits the OID list into sequential batches of at most that size. Use this for devices that reject multi-OID GETs — set it to `1` if the device documentation states only one OID per request is supported. See [Batched GET Requests](#batched-get-requests) below.
 - `oids` (array): List of OID configurations
 - `constants` (array, optional): List of constant variable configurations
 
@@ -170,6 +173,26 @@ By default every OID is read on every poll cycle (`poll_every: 1`). Setting `pol
 
 **Cycles with no OIDs due:** if a combination of `poll_every` values results in a cycle where no OID is due, the SNMP GET is skipped entirely. `snmp_polling_age` continues to tick and is pushed to OPC UA; all other state is left unchanged.
 
+## Batched GET Requests
+
+Some devices only accept a single OID per SNMP GET request. Use `oids_per_get` in the device config (or `--default-oids-per-get` for a server-wide default) to enable batching:
+
+```json
+{
+  "host": "192.168.1.50",
+  "opcua_path": "RestrictedDevice",
+  "oids_per_get": 1,
+  "oids": [
+    {"oid": "1.3.6.1.2.1.1.1.0", "opcua_name": "sysDescr",  "opcua_type": "String"},
+    {"oid": "1.3.6.1.2.1.1.3.0", "opcua_name": "sysUpTime", "opcua_type": "UInt32"}
+  ]
+}
+```
+
+With `oids_per_get: 1`, the two OIDs above are fetched in two separate GET requests per cycle. The results are merged before any store updates or staleness logic runs, so the rest of the polling behaviour is identical to the unlimited case.
+
+If the device stops responding part-way through a batch, any results already received from earlier chunks are discarded and the entire cycle is treated as a failure — consistent with how a transport failure behaves in the single-GET case.
+
 ## Example Configuration File
 
 ```json
@@ -255,9 +278,33 @@ The bridge uses appropriate OPC UA status codes:
 - `BadNoCommunication`: Device unreachable and variable lifetime has expired
 - `BadDataEncodingInvalid`: Type conversion failed
 
+## Subclassing
+
+`SNMPPoller` is designed to be subclassed for devices that require derived variables or custom OPC UA method handlers. The key hooks are `build_variable_specs()`, `create_variables()`, `write_variables()`, and `on_address_space_ready()`.
+
+### The `updated_this_cycle` flag
+
+Each OID store entry (`self._store[opcua_name]`) carries an `updated_this_cycle` boolean that is `True` only when the SNMP poll in the current cycle successfully stored a fresh value for that OID. It is cleared at the start of every cycle before the GET, and is never set for constants or built-in variables.
+
+This flag is particularly important in `write_variables()` overrides that compute derived values from raw OID data. Without it, a derived conversion applied to a value that was already converted in a previous cycle (because `poll_every > 1` means the OID was not re-read this cycle) will fail or produce a wrong result. The correct pattern is:
+
+```python
+async def write_variables(self):
+    entry = self._store["_rawTemperature"]
+    if entry.updated_this_cycle:
+        # raw bytes fresh from SNMP — safe to convert
+        raw = entry.data_value.Value.Value
+        self._store["temperature"].data_value = ua.DataValue(
+            ua.Variant(self._convert_temperature(raw), ua.VariantType.Float)
+        )
+    await super().write_variables()
+```
+
+If `updated_this_cycle` is `False`, the source OID was not polled this cycle and the derived variable's existing store value (from the last cycle it was updated) should be left unchanged.
+
 ## Logging
 
-Logs include polling activity, device state changes, and errors. Use `--log-level DEBUG` for detailed per-cycle SNMP transaction logs including which OIDs were requested each cycle.
+Logs include polling activity, device state changes, and errors. Use `--log-level DEBUG` for detailed per-cycle SNMP transaction logs including which OIDs were requested each cycle, and — when batching is active — how many chunks were sent per cycle.
 
 ## License
 
