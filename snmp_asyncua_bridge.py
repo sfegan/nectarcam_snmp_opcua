@@ -563,6 +563,14 @@ class StoreEntry:
                     only — forced full-reloads never advance next_cycle).
                     Reset to _polling_cycle when the device goes offline so all
                     variables are re-read on the next successful cycle.
+    updated_this_cycle
+                    True when this entry received a fresh value from SNMP in the
+                    current _poll_once() cycle.  Cleared at the start of every
+                    cycle (before the GET) and set when the SNMP response is
+                    stored.  Always False for constants and built-in variables.
+                    Subclasses may read this in write_variables() to gate
+                    derived-value computation on whether the source OID(s) were
+                    actually updated this cycle.
     """
     data_value:       ua.DataValue
     timestamp:        Optional[float]   # time.monotonic(), or None if never read
@@ -570,6 +578,8 @@ class StoreEntry:
     opcua_type:       str
     is_local:         bool = False
     next_cycle:       int  = 0        # PLL cycle on which this variable is next due
+    updated_this_cycle: bool = False  # set by _poll_once when a fresh SNMP value is
+                                      # stored; cleared at the start of each cycle
 
 
 @dataclass
@@ -600,11 +610,15 @@ class SNMPPoller:
     variables listed in ``_BUILTIN_VARIABLE_NAMES``.
 
     Each entry tracks:
-      • ``data_value``       – current ua.DataValue (value + status)
-      • ``timestamp``        – monotonic time of last successful SNMP read
-      • ``lifetime`` – expiry window in seconds (0 = never)
-      • ``opcua_type``       – OPC UA type name string
-      • ``is_local``         – True for underscore-prefixed OID variables
+      • ``data_value``          – current ua.DataValue (value + status)
+      • ``timestamp``           – monotonic time of last successful SNMP read
+      • ``lifetime``            – expiry window in seconds (0 = never)
+      • ``opcua_type``          – OPC UA type name string
+      • ``is_local``            – True for underscore-prefixed OID variables
+      • ``updated_this_cycle``  – True when a fresh SNMP value was stored this
+                                  cycle; always False for constants and built-ins.
+                                  Subclasses may gate derived-value computation on
+                                  this flag in ``write_variables()``.
 
     Lifetime / staleness management (handled in poll_once)
     -------------------------------------------------------
@@ -1529,6 +1543,15 @@ class SNMPPoller:
         now = time.monotonic()
         wall_now = datetime.datetime.now(datetime.timezone.utc)
 
+        # ── Clear per-cycle freshness flag on all OID entries ─────────────────
+        # Done unconditionally before the GET so write_variables() always sees a
+        # consistent state regardless of whether this is a scheduled poll, a
+        # force_full, or a cycle where the device turns out to be offline.
+        for oid_cfg in self.oids:
+            entry = self._store.get(oid_cfg.opcua_name)
+            if entry is not None:
+                entry.updated_this_cycle = False
+
         # ── Build the set of OIDs to request this cycle ───────────────────────
         if force_full:
             due_oids = self.oids
@@ -1652,6 +1675,7 @@ class SNMPPoller:
             else:
                 entry.data_value = variant   # already a DataValue (cast failed)
             entry.timestamp = now
+            entry.updated_this_cycle = True
             responded.add(oid_cfg.opcua_name)
 
             # Advance next_cycle for scheduled polls only — force_full never
