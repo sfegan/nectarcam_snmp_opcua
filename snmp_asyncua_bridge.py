@@ -230,7 +230,7 @@ _UA_TYPE_ZEROS: Dict[str, Any] = {
 #   identity       : snmp_host, snmp_port
 #   polling metrics: snmp_polling_timestamp, snmp_polling_age,
 #                    snmp_polling_interval, snmp_polling_success_count
-#   state flags    : snmp_server_online (bridge fact), cls_state (overridable)
+#   state flags    : snmp_server_online (bridge fact), device_state (overridable)
 _BUILTIN_VARIABLE_NAMES: frozenset[str] = frozenset({
     "snmp_host",
     "snmp_port",
@@ -239,7 +239,7 @@ _BUILTIN_VARIABLE_NAMES: frozenset[str] = frozenset({
     "snmp_polling_interval",
     "snmp_polling_success_count",
     "snmp_server_online",
-    "cls_state",
+    "device_state",
 })
 
 
@@ -595,7 +595,7 @@ class SNMPPoller:
       • snmp_polling_interval       (Double)    – configured poll interval in seconds
       • snmp_polling_success_count  (UInt32)    – cumulative count of successful polls (always Good)
       • snmp_server_online          (Boolean)   – True when SNMP agent is reachable; never modified by subclasses
-      • cls_state                   (Byte)      – 0 = offline, 1 = online (may be overridden by subclasses)
+      • device_state                (Int32)     – 0 = offline, 1 = online (may be overridden by subclasses)
 
     OID variables whose ``opcua_name`` begins with ``"_"`` are *local*: they are
     polled from SNMP and stored in the internal data store but no OPC UA node is
@@ -934,8 +934,8 @@ class SNMPPoller:
                 "Mirrors the bridge reachability state; never modified by subclasses."
             ),
         )
-        specs["cls_state"] = NodeSpec(
-            opcua_type="Byte",
+        specs["device_state"] = NodeSpec(
+            opcua_type="Int32",
             initial_value=0,
             description="Device state: 0 = offline, 1 = online",
         )
@@ -1138,8 +1138,8 @@ class SNMPPoller:
             opcua_type="Boolean",
             is_local=False,
         )
-        self._store["cls_state"] = StoreEntry(
-            data_value=ua.DataValue(ua.Variant(0, ua.VariantType.Byte)),
+        self._store["device_state"] = StoreEntry(
+            data_value=ua.DataValue(ua.Variant(0, ua.VariantType.Int32)),
             timestamp=time.monotonic(),
             lifetime=0.0,
             opcua_type="Byte",
@@ -1527,7 +1527,7 @@ class SNMPPoller:
         • Staleness (_apply_staleness) is called only for OIDs that were
           requested this cycle and did not respond (online path), or for all
           OIDs (offline path).  OIDs not due this cycle are never touched.
-        • Update cls_state (1 = online, 0 = offline) in the store.
+        • Update device_state (1 = online, 0 = offline) in the store.
         • Call write_variables() once at the end of every cycle.
 
         OID key resolution is cached after the first successful poll and
@@ -1605,8 +1605,8 @@ class SNMPPoller:
                 if entry is not None:
                     self._apply_staleness(oid_cfg.opcua_name, entry, now)
 
-            self._store["cls_state"].data_value = ua.DataValue(
-                ua.Variant(0, ua.VariantType.Byte)
+            self._store["device_state"].data_value = ua.DataValue(
+                ua.Variant(0, ua.VariantType.Int32)
             )
             self._store["snmp_server_online"].data_value = ua.DataValue(
                 ua.Variant(False, ua.VariantType.Boolean)
@@ -1703,8 +1703,8 @@ class SNMPPoller:
         )
         self._store["snmp_polling_age"].timestamp = now
 
-        self._store["cls_state"].data_value = ua.DataValue(
-            ua.Variant(1, ua.VariantType.Byte)
+        self._store["device_state"].data_value = ua.DataValue(
+            ua.Variant(1, ua.VariantType.Int32)
         )
         self._store["snmp_server_online"].data_value = ua.DataValue(
             ua.Variant(True, ua.VariantType.Boolean)

@@ -260,7 +260,7 @@ The bridge creates the following structure in the OPC UA server:
     - `snmp_polling_interval` (Double): Configured poll interval in seconds
     - `snmp_polling_success_count` (UInt32): Cumulative count of successful polls
     - `snmp_server_online` (Boolean): True when the SNMP agent is reachable
-    - `cls_state` (Byte): Bridge connection state (0 = offline, 1 = online)
+    - `device_state` (Int32): Bridge connection state (0 = offline, 1 = online)
     - `{opcua_name}`: Configured OID and constant variables
 
 For example, with `--opcua-root SNMPDevices` and `opcua_path: "Switch.Monitoring"`, the device variables would be under `Objects/SNMPDevices/Switch/Monitoring/`.
