@@ -157,12 +157,10 @@ except ImportError:
 # Logging helpers
 # ─────────────────────────────────────────────────────────────────────────────
 
-def setup_logging(level: str, log_file: Optional[str]) -> logging.Logger:
-    logger = logging.getLogger("snmp_asyncua_bridge")
-    logger.setLevel(getattr(logging, level.upper(), logging.INFO))
-    # Remove any handlers added by a previous call (e.g. in tests) so we never
-    # accumulate duplicate handlers and produce doubled log lines.
-    logger.handlers.clear()
+def setup_logging(level: str, log_file: Optional[str], name: str = "snmp_asyncua_bridge") -> logging.Logger:
+    root = logging.getLogger()
+    root.setLevel(getattr(logging, level.upper(), logging.INFO))
+    root.handlers.clear()
     fmt = logging.Formatter(
         "%(asctime)s.%(msecs)03d  %(levelname)-8s  %(name)s  %(message)s",
         datefmt="%Y-%m-%dT%H:%M:%S",
@@ -174,8 +172,9 @@ def setup_logging(level: str, log_file: Optional[str]) -> logging.Logger:
         ))
     for h in handlers:
         h.setFormatter(fmt)
-        logger.addHandler(h)
-    return logger
+        root.addHandler(h)
+    logging.getLogger("asyncua").setLevel(logging.WARNING)
+    return logging.getLogger(name)
 
 
 log = logging.getLogger("snmp_asyncua_bridge")
