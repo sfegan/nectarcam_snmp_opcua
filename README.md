@@ -171,7 +171,7 @@ By default every OID is read on every poll cycle (`poll_every: 1`). Setting `pol
 
 **Device going offline:** when the SNMP agent becomes unreachable, all OIDs are immediately marked stale (regardless of `poll_every`) and all per-OID schedules are reset so that every variable is re-read on the next successful cycle. The sub-sampling phase is reset from that point.
 
-**Cycles with no OIDs due:** if a combination of `poll_every` values results in a cycle where no OID is due, the SNMP GET is skipped entirely. `snmp_polling_age` continues to tick and is pushed to OPC UA; all other state is left unchanged.
+**Cycles with no OIDs due:** if a combination of `poll_every` values results in a cycle where no OID is due, the SNMP GET is skipped entirely. `device_polling_age` continues to tick and is pushed to OPC UA; all other state is left unchanged.
 
 ## Batched GET Requests
 
@@ -253,13 +253,13 @@ The bridge creates the following structure in the OPC UA server:
 
 - `Objects/{root_path}/` (configurable root container)
   - `{opcua_path}/` (device folder, can be multi-level)
-    - `snmp_host` (String): Device IP address
-    - `snmp_port` (UInt16): Device SNMP UDP port
-    - `snmp_polling_timestamp` (DateTime): Wall-clock time of the last successful poll
-    - `snmp_polling_age` (Double): Seconds since the last successful poll
-    - `snmp_polling_interval` (Double): Configured poll interval in seconds
-    - `snmp_polling_success_count` (UInt32): Cumulative count of successful polls
-    - `snmp_server_online` (Boolean): True when the SNMP agent is reachable
+    - `device_host` (String): Device IP address
+    - `device_port` (UInt16): Device SNMP UDP port
+    - `device_polling_timestamp` (DateTime): Wall-clock time of the last successful poll
+    - `device_polling_age` (Double): Seconds since the last successful poll
+    - `device_polling_interval` (Double): Configured poll interval in seconds
+    - `device_polling_success_count` (UInt32): Cumulative count of successful polls
+    - `device_server_online` (Boolean): True when the SNMP agent is reachable; never modified by subclasses
     - `device_state` (Int32): Bridge connection state (0 = offline, 1 = online)
     - `{opcua_name}`: Configured OID and constant variables
 
