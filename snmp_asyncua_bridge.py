@@ -1627,7 +1627,7 @@ class SNMPPoller:
 
         # ── Device is responding ──────────────────────────────────────────────
         if self._was_offline:
-            log.info("Device came online: %s — resolving OID keys", self.host)
+            log.warning("Device came online: %s — resolving OID keys", self.host)
             self._oid_key_cache.clear()
             for oid_cfg in self.oids:
                 key = self._resolve_oid_key(oid_cfg, results)
@@ -1686,7 +1686,7 @@ class SNMPPoller:
         # ── Apply staleness to due OIDs that did not respond this cycle ───────
         # Only due_oids are candidates — non-due OIDs are left entirely untouched.
         for oid_cfg in due_oids:
-            if oid_cfg.opcua_name not in responded and self._oid_key_cache.get(oid_cfg.opcua_name) is not None:
+            if oid_cfg.opcua_name not in responded                     and self._oid_key_cache.get(oid_cfg.opcua_name) is not None:
                 entry = self._store.get(oid_cfg.opcua_name)
                 if entry is not None:
                     self._apply_staleness(oid_cfg.opcua_name, entry, now)
@@ -1935,6 +1935,50 @@ class OPCUAServer:
             log.info("Address space built for %s (%d variable(s))",
                      poller.opcua_path, len(poller._node_map))
 
+    # ── heartbeat ─────────────────────────────────────────────────────────────
+
+    _HEARTBEAT_INTERVAL: float = 300.0   # seconds between summary log lines
+
+    async def _heartbeat(self) -> None:
+        """
+        Log a one-line summary for every registered poller every
+        _HEARTBEAT_INTERVAL seconds (default: 5 minutes).
+
+        Each line reports:
+          • opcua_path  — the poller's OPC UA path (device identity)
+          • host        — SNMP device IP
+          • online      — current snmp_server_online value
+          • polls       — cumulative successful SNMP poll count
+          • age         — seconds since last successful poll (or "never")
+        """
+        await asyncio.sleep(self._HEARTBEAT_INTERVAL)
+        while True:
+            for poller in self._pollers:
+                store = poller._store
+                online_entry = store.get("snmp_server_online")
+                count_entry  = store.get("snmp_polling_success_count")
+                age_entry    = store.get("snmp_polling_age")
+
+                online = (
+                    online_entry.data_value.Value.Value
+                    if online_entry and online_entry.data_value.Value else "?"
+                )
+                count = (
+                    int(count_entry.data_value.Value.Value)
+                    if count_entry and count_entry.data_value.Value else "?"
+                )
+                age_val = (
+                    age_entry.data_value.Value.Value
+                    if age_entry and age_entry.data_value.Value else None
+                )
+                age_str = f"{age_val:.1f}s ago" if isinstance(age_val, float) else "never"
+
+                log.info(
+                    "Heartbeat: %s (%s)  online=%s  polls=%s  last_poll=%s",
+                    poller.opcua_path, poller.host, online, count, age_str,
+                )
+            await asyncio.sleep(self._HEARTBEAT_INTERVAL)
+
     # ── main entry point ──────────────────────────────────────────────────────
 
     async def run(self) -> None:
@@ -1984,6 +2028,9 @@ class OPCUAServer:
                 asyncio.create_task(poller.run(), name=f"poller-{poller.host}")
                 for poller in self._pollers
             ]
+            tasks.append(
+                asyncio.create_task(self._heartbeat(), name="heartbeat")
+            )
             for t in tasks:
                 t.add_done_callback(_task_done)
             log.debug("Launched %d poller task(s): %s",
