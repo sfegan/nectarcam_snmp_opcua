@@ -993,16 +993,32 @@ class SNMPPoller:
         Create OPC UA variable nodes from *specs* under *device_node* and
         register them in self._node_map.
 
+        Each variable is created with a string NodeId derived from the full
+        path to the device plus the variable name, e.g.::
+
+            ns=2;s="SNMPDevices.Switch01.Monitoring.sysDescr"
+
+        This replaces the auto-generated numeric NodeIds (``ns=2;i=19``) with
+        stable, human-readable identifiers that survive server restarts.
+
         Override to customise node creation — e.g. to set different access
         levels or add nodes that live outside the spec dict entirely.  Call
         super() to let the base implementation handle the standard specs, then
         add your extra nodes afterwards.
         """
+        # _opcua_node_path is set by OPCUAServer._build_address_space before
+        # create_variables is called.  Fall back to opcua_path (without the
+        # server root prefix) when called outside that context, e.g. in tests.
+        base_path = getattr(self, "_opcua_node_path", None) or self.opcua_path
+
         for opcua_name, spec in specs.items():
             variant_type, _cast_fn = _UA_TYPE_MAP[spec.opcua_type]
+            # Build a stable string NodeId: "BasePath.VariableName"
+            string_id = f"{base_path}.{opcua_name}" if base_path else opcua_name
+            node_id = ua.NodeId(string_id, ns_idx, ua.NodeIdType.String)
             var_node = await device_node.add_variable(
-                ns_idx,
-                opcua_name,
+                node_id,
+                ua.QualifiedName(opcua_name, ns_idx),
                 ua.Variant(spec.initial_value, variant_type),
             )
             await var_node.set_writable(False)
@@ -1875,13 +1891,22 @@ class OPCUAServer:
         server: Server,
         ns_idx: int,
         path_parts: List[str],
-    ) -> Any:
+    ) -> tuple[Any, str]:
         """
         Walk (and create where missing) a chain of Object nodes under Objects/.
-        Returns the deepest node in the chain.
+
+        Returns ``(node, path_string)`` where *path_string* is the dot-joined
+        absolute path of the deepest node (e.g. ``"SNMPDevices.Switch01"``).
+        Object nodes are created with string NodeIds derived from that path so
+        that clients see stable, human-readable identifiers instead of
+        auto-generated numeric ones (``ns=2;s="SNMPDevices.Switch01"``).
         """
         parent = server.nodes.objects
+        accumulated: List[str] = []
         for part in path_parts:
+            accumulated.append(part)
+            node_path_str = ".".join(accumulated)
+            node_id = ua.NodeId(node_path_str, ns_idx, ua.NodeIdType.String)
             found = None
             try:
                 for child in await parent.get_children():
@@ -1892,12 +1917,12 @@ class OPCUAServer:
                 log.warning("Error walking OPC UA address space at %r: %s — "
                             "will attempt to create the node anyway", part, exc)
             if found is None:
-                found = await parent.add_object(ns_idx, part)
-                log.debug("Created OPC UA object node: %s", part)
+                found = await parent.add_object(node_id, ua.QualifiedName(part, ns_idx))
+                log.debug("Created OPC UA object node: %s  (node_id=%s)", part, node_id)
             else:
                 log.debug("Reused existing OPC UA object node: %s", part)
             parent = found
-        return parent
+        return parent, ".".join(path_parts)
 
     async def _build_address_space(self, server: Server, ns_idx: int) -> None:
         """Create all OPC UA nodes for every registered poller."""
@@ -1909,10 +1934,14 @@ class OPCUAServer:
             # directly under Objects/; an empty opcua_path is unusual but valid
             # and would place the device node inside the root container itself.
             poller_parts = [p for p in poller.opcua_path.split(".") if p]
-            device_node = await self._ensure_path(
-                server, ns_idx, self.root_parts + poller_parts
+            all_parts = self.root_parts + poller_parts
+            device_node, node_path_str = await self._ensure_path(
+                server, ns_idx, all_parts
             )
             poller._device_node = device_node
+            # Store the absolute dot-joined path so create_variables can build
+            # string NodeIds of the form  ns=2;s="SNMPDevices.Switch01.some_var"
+            poller._opcua_node_path = node_path_str
 
             # ── device description on the object node ─────────────────────────
             if poller.description:
