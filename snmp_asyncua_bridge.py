@@ -1686,7 +1686,7 @@ class SNMPPoller:
         # ── Apply staleness to due OIDs that did not respond this cycle ───────
         # Only due_oids are candidates — non-due OIDs are left entirely untouched.
         for oid_cfg in due_oids:
-            if oid_cfg.opcua_name not in responded                     and self._oid_key_cache.get(oid_cfg.opcua_name) is not None:
+            if oid_cfg.opcua_name not in responded and self._oid_key_cache.get(oid_cfg.opcua_name) is not None:
                 entry = self._store.get(oid_cfg.opcua_name)
                 if entry is not None:
                     self._apply_staleness(oid_cfg.opcua_name, entry, now)
