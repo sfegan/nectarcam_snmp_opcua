@@ -22,7 +22,7 @@ This project provides an OPC UA server that polls SNMP devices and exposes their
 Install the required dependencies:
 
 ```bash
-pip install pysnmp-lextudio asyncua
+pip install pysnmp asyncua
 ```
 
 For symbolic OID name resolution, install `net-snmp` (provides `snmptranslate`) or ensure pysnmp's built-in MIBs are sufficient. Symbolic names like `"SNMPv2-MIB::sysDescr.0"` are automatically converted to numeric OIDs at startup.
@@ -64,6 +64,24 @@ python snmp_asyncua_bridge.py \
 - `--device-config`: Path to JSON configuration file (can be specified multiple times).
 - `--dump-device-config`: Path to a JSON file to write the fully-resolved device configuration just before the event loop starts, then continue running normally. The output is reconstructed from the live poller instances so every field is present with its resolved value: symbolic OIDs are in dotted-decimal, multi-IP entries are fully expanded, and all defaults are filled in. Reloading the file reproduces identical behaviour regardless of CLI defaults.
 - `--publish-local-oids`: Strip leading underscores from local (underscore-prefixed) OID names so they are published as OPC UA variables instead of being kept server-side only. Intended for testing and diagnostics.
+
+### Resolving OID Names
+
+The `resolve_oids.py` utility can be used to pre-resolve symbolic OID names to dotted-decimal notation before running the server. This is useful for inspecting or debugging configurations.
+
+```bash
+# Forward mode: convert symbolic names to dotted-decimal
+python resolve_oids.py device_localhost.json > resolved.json
+
+# Reverse mode: convert dotted-decimal to symbolic names
+python resolve_oids.py -r resolved.json > symbolic.json
+```
+
+**Forward mode** converts symbolic OID names (e.g., `"SNMPv2-MIB::sysDescr.0"`) to dotted-decimal notation (e.g., `"1.3.6.1.2.1.1.1.0"`). Uses the same resolution logic as the bridge (snmptranslate, then pysnmp).
+
+**Reverse mode** (with `-r` or `--reverse`) converts dotted-decimal OIDs back to symbolic names. Requires `snmptranslate` (from net-snmp) to be installed.
+
+Multi-IP configurations (where `"host"` is an array) are left unexpanded — only OID strings are translated. The output is a single JSON object if exactly one file with a single object was provided; otherwise, a JSON array is written.
 
 ## Configuration
 
@@ -171,7 +189,7 @@ By default every OID is read on every poll cycle (`poll_every: 1`). Setting `pol
 
 **Device going offline:** when the SNMP agent becomes unreachable, all OIDs are immediately marked stale (regardless of `poll_every`) and all per-OID schedules are reset so that every variable is re-read on the next successful cycle. The sub-sampling phase is reset from that point.
 
-**Cycles with no OIDs due:** if a combination of `poll_every` values results in a cycle where no OID is due, the SNMP GET is skipped entirely. `device_polling_age` continues to tick and is pushed to OPC UA; all other state is left unchanged.
+**Cycles with no OIDs due:** if a combination of `poll_every` values results in a cycle where no OID is due, the SNMP GET is skipped entirely. `device_connection_downtime` continues to tick and is pushed to OPC UA; all other state is left unchanged.
 
 ## Batched GET Requests
 
@@ -255,11 +273,10 @@ The bridge creates the following structure in the OPC UA server:
   - `{opcua_path}/` (device folder, can be multi-level)
     - `device_host` (String): Device IP address
     - `device_port` (UInt16): Device SNMP UDP port
-    - `device_polling_timestamp` (DateTime): Wall-clock time of the last successful poll
-    - `device_polling_age` (Double): Seconds since the last successful poll
     - `device_polling_interval` (Double): Configured poll interval in seconds
-    - `device_polling_success_count` (UInt32): Cumulative count of successful polls
-    - `device_server_online` (Boolean): True when the SNMP agent is reachable; never modified by subclasses
+    - `device_connection_downtime` (Double): Seconds since the last successful poll (0.0 while connected/online). Always has Good status.
+    - `device_connection_uptime` (Double): Seconds since the device last came online (0.0 while offline). Always has Good status.
+    - `device_connection_established` (Boolean): True when the SNMP agent is reachable; mirrors the bridge reachability state and is never modified by subclasses
     - `device_state` (Int32): Bridge connection state (0 = offline, 1 = online)
     - `{opcua_name}`: Configured OID and constant variables
 
