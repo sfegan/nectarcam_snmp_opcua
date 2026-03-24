@@ -997,11 +997,39 @@ class SNMPPoller:
         This replaces the auto-generated numeric NodeIds (``ns=2;i=19``) with
         stable, human-readable identifiers that survive server restarts.
 
+        MinimumSamplingInterval is set once on every node according to these
+        rules (all values in milliseconds):
+          • device_host, device_port, device_polling_interval,
+            constants with a real value  →  -1  (never changes; exception-driven)
+          • device_connection_downtime, device_connection_uptime,
+            device_connection_established, device_state,
+            constants with value=None    →  poll_interval * 1000
+          • OID variables                →  poll_interval * poll_every * 1000
+
         Override to customise node creation — e.g. to set different access
         levels or add nodes that live outside the spec dict entirely.  Call
         super() to let the base implementation handle the standard specs, then
         add your extra nodes afterwards.
         """
+        # ── Build MinimumSamplingInterval lookup ──────────────────────────────
+        _poll_ms = self.poll_interval * 1000.0
+        _static_builtins = frozenset({
+            "device_host", "device_port", "device_polling_interval",
+        })
+        _dynamic_builtins = frozenset({
+            "device_connection_downtime", "device_connection_uptime",
+            "device_connection_established", "device_state",
+        })
+        _min_sampling: Dict[str, float] = {}
+        for name in _static_builtins:
+            _min_sampling[name] = -1.0
+        for name in _dynamic_builtins:
+            _min_sampling[name] = _poll_ms
+        for oid_cfg in self.oids:
+            if not oid_cfg.is_local:
+                _min_sampling[oid_cfg.opcua_name] = _poll_ms * oid_cfg.poll_every
+        for const_cfg in self.constants:
+            _min_sampling[const_cfg.opcua_name] = -1.0 if const_cfg.value is not None else _poll_ms
         # _opcua_node_path is set by OPCUAServer._build_address_space before
         # create_variables is called.  Fall back to opcua_path (without the
         # server root prefix) when called outside that context, e.g. in tests.
@@ -1035,9 +1063,15 @@ class SNMPPoller:
                         )
                     ),
                 )
+            min_sampling = _min_sampling.get(opcua_name, _poll_ms)
+            await var_node.write_attribute(
+                ua.AttributeIds.MinimumSamplingInterval,
+                ua.DataValue(ua.Variant(min_sampling, ua.VariantType.Double)),
+            )
             self._node_map[opcua_name] = var_node
-            log.debug("  OPC UA variable: %s.%s (%s)  node_id=%s",
-                      self.opcua_path, opcua_name, spec.opcua_type, var_node.nodeid)
+            log.debug("  OPC UA variable: %s.%s (%s)  node_id=%s  min_sampling=%.0fms",
+                      self.opcua_path, opcua_name, spec.opcua_type, var_node.nodeid,
+                      min_sampling)
 
     async def write_variables(self) -> None:
         """
