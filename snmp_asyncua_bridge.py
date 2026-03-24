@@ -228,17 +228,16 @@ _UA_TYPE_ZEROS: Dict[str, Any] = {
 # Ordering reflects the logical grouping used in build_variable_specs() and
 # _init_store():
 #   identity       : device_host, device_port
-#   polling metrics: device_polling_timestamp, device_polling_age,
-#                    device_polling_interval, device_polling_success_count
-#   state flags    : device_server_online (bridge fact), device_state (overridable)
+#   polling metrics: device_polling_interval,
+#                    device_connection_downtime, device_connection_uptime
+#   state flags    : device_connection_established (bridge fact), device_state (overridable)
 _BUILTIN_VARIABLE_NAMES: frozenset[str] = frozenset({
     "device_host",
     "device_port",
-    "device_polling_timestamp",
-    "device_polling_age",
     "device_polling_interval",
-    "device_polling_success_count",
-    "device_server_online",
+    "device_connection_downtime",
+    "device_connection_uptime",
+    "device_connection_established",
     "device_state",
 })
 
@@ -586,16 +585,15 @@ class SNMPPoller:
     """
     Polls a single SNMP device (SNMPv2c) and writes values to OPC UA nodes.
 
-    Automatically adds eight built-in variables to the OPC UA object
+    Automatically adds seven built-in variables to the OPC UA object
     (see also ``_BUILTIN_VARIABLE_NAMES``):
-      • device_host                   (String)    – IP address of the device
-      • device_port                   (UInt16)    – UDP port of the SNMP agent
-      • device_polling_timestamp      (DateTime)  – wall-clock time of the last successful poll
-      • device_polling_age            (Double)    – seconds since the last successful poll (always Good)
-      • device_polling_interval       (Double)    – configured poll interval in seconds
-      • device_polling_success_count  (UInt32)    – cumulative count of successful polls (always Good)
-      • device_server_online          (Boolean)   – True when SNMP agent is reachable; never modified by subclasses
-      • device_state                (Int32)     – 0 = offline, 1 = online (may be overridden by subclasses)
+      • device_host                     (String)  – IP address of the device
+      • device_port                     (UInt16)  – UDP port of the SNMP agent
+      • device_polling_interval         (Double)  – configured poll interval in seconds
+      • device_connection_downtime      (Double)  – seconds since the last successful poll; 0.0 while connected (always Good)
+      • device_connection_uptime        (Double)  – seconds since the device last came online; 0.0 while offline (always Good)
+      • device_connection_established   (Boolean) – True when SNMP agent is reachable; never modified by subclasses
+      • device_state                    (Int32)   – 0 = offline, 1 = online (may be overridden by subclasses)
 
     OID variables whose ``opcua_name`` begins with ``"_"`` are *local*: they are
     polled from SNMP and stored in the internal data store but no OPC UA node is
@@ -735,6 +733,11 @@ class SNMPPoller:
     # offline so keys are re-resolved on recovery.
     _oid_key_cache: Dict[str, str] = field(default_factory=dict, init=False, repr=False)
     _was_offline: bool = field(default=True, init=False, repr=False)
+    # Monotonic timestamp of the most recent online↔offline state transition.
+    # None until the first poll result (success or failure) is observed.
+    # Used to compute device_connection_uptime (when online) and
+    # device_connection_downtime (when offline).
+    _last_state_change_at: Optional[float] = field(default=None, init=False, repr=False)
 
     # ─────────────────────────────────────────────────────────────────────────
 
@@ -904,29 +907,22 @@ class SNMPPoller:
             initial_value=self.port,
             description="UDP port of the SNMP agent",
         )
-        specs["device_polling_timestamp"] = NodeSpec(
-            opcua_type="DateTime",
-            initial_value=datetime.datetime.fromtimestamp(0, tz=datetime.timezone.utc),
-            description="Wall-clock time of the last successful poll",
-            initial_status=ua.StatusCode(ua.StatusCodes.BadWaitingForInitialData),
-        )
-        specs["device_polling_age"] = NodeSpec(
-            opcua_type="Double",
-            initial_value=0.0,
-            description="Seconds since the last successful poll (always Good status)",
-            initial_status=ua.StatusCode(ua.StatusCodes.BadWaitingForInitialData),
-        )
         specs["device_polling_interval"] = NodeSpec(
             opcua_type="Double",
             initial_value=self.poll_interval,
             description="Configured poll interval in seconds",
         )
-        specs["device_polling_success_count"] = NodeSpec(
-            opcua_type="UInt32",
-            initial_value=0,
-            description="Cumulative count of successful SNMP polls (always Good status)",
+        specs["device_connection_downtime"] = NodeSpec(
+            opcua_type="Double",
+            initial_value=0.0,
+            description="Seconds since the last successful poll; 0.0 while connected (always Good status)",
         )
-        specs["device_server_online"] = NodeSpec(
+        specs["device_connection_uptime"] = NodeSpec(
+            opcua_type="Double",
+            initial_value=0.0,
+            description="Seconds since the device last came online; 0.0 while offline (always Good status)",
+        )
+        specs["device_connection_established"] = NodeSpec(
             opcua_type="Boolean",
             initial_value=False,
             description=(
@@ -1114,51 +1110,50 @@ class SNMPPoller:
         ]:
             variant_type, cast_fn = _UA_TYPE_MAP[opcua_type]
             self._store[name] = StoreEntry(
-                data_value=ua.DataValue(ua.Variant(cast_fn(value), variant_type)),
+                data_value=ua.DataValue(
+                    Value=ua.Variant(cast_fn(value), variant_type),
+                    SourceTimestamp=datetime.datetime.now(datetime.timezone.utc),
+                ),
                 timestamp=time.monotonic(),
                 lifetime=0.0,
                 opcua_type=opcua_type,
                 is_local=False,
             )
 
-        # device_polling_timestamp and device_polling_age start as BadWaitingForInitialData;
-        # both are updated only on a successful SNMP poll.
-        self._store["device_polling_timestamp"] = StoreEntry(
-            data_value=_make_status_dv("DateTime", _waiting),
-            timestamp=None,
-            lifetime=0.0,
-            opcua_type="DateTime",
-            is_local=False,
-        )
-        self._store["device_polling_age"] = StoreEntry(
-            data_value=_make_status_dv("Double", _waiting),
-            timestamp=None,
-            lifetime=0.0,
-            opcua_type="Double",
-            is_local=False,
-        )
-        # device_polling_success_count: server-side counter, always Good, never expires.
-        self._store["device_polling_success_count"] = StoreEntry(
-            data_value=ua.DataValue(ua.Variant(0, ua.VariantType.UInt32)),
-            timestamp=time.monotonic(),
-            lifetime=0.0,
-            opcua_type="UInt32",
-            is_local=False,
-        )
-        # device_server_online: bridge-level reachability flag, always Good, never expires.
+        # device_connection_downtime and device_connection_uptime: start at 0.0
+        # (Good status); updated every cycle in _poll_once.
+        for name in ("device_connection_downtime", "device_connection_uptime"):
+            self._store[name] = StoreEntry(
+                data_value=ua.DataValue(
+                    Value=ua.Variant(0.0, ua.VariantType.Double),
+                    SourceTimestamp=datetime.datetime.now(datetime.timezone.utc),
+                ),
+                timestamp=time.monotonic(),
+                lifetime=0.0,
+                opcua_type="Double",
+                is_local=False,
+            )
+
+        # device_connection_established: bridge-level reachability flag, always Good, never expires.
         # Set only by _poll_once(); subclasses must not modify this entry.
-        self._store["device_server_online"] = StoreEntry(
-            data_value=ua.DataValue(ua.Variant(False, ua.VariantType.Boolean)),
+        self._store["device_connection_established"] = StoreEntry(
+            data_value=ua.DataValue(
+                Value=ua.Variant(False, ua.VariantType.Boolean),
+                SourceTimestamp=datetime.datetime.now(datetime.timezone.utc),
+            ),
             timestamp=time.monotonic(),
             lifetime=0.0,
             opcua_type="Boolean",
             is_local=False,
         )
         self._store["device_state"] = StoreEntry(
-            data_value=ua.DataValue(ua.Variant(0, ua.VariantType.Int32)),
+            data_value=ua.DataValue(
+                Value=ua.Variant(0, ua.VariantType.Int32),
+                SourceTimestamp=datetime.datetime.now(datetime.timezone.utc),
+            ),
             timestamp=time.monotonic(),
             lifetime=0.0,
-            opcua_type="Byte",
+            opcua_type="Int32",
             is_local=False,
         )
 
@@ -1531,19 +1526,22 @@ class SNMPPoller:
         ----------------
         • Build the per-cycle OID request list from due variables (or all OIDs
           when force_full=True).
-        • Update device_polling_timestamp and device_polling_age only on a
-          successful poll, using the initiation time so they reflect when the
-          request was sent rather than when the response arrived.
         • On a successful response: update store entries for every OID that
-          replied; resolve and cache OID keys on the first post-offline cycle;
-          advance next_cycle for each responding OID (scheduled polls only).
+          replied with SourceTimestamp=wall_now; resolve and cache OID keys on
+          the first post-offline cycle; advance next_cycle for each responding
+          OID (scheduled polls only).  Reset device_connection_downtime to 0.0
+          and update device_connection_uptime.
         • On a failed response (device offline): reset next_cycle to
           _polling_cycle for all OIDs (so they all fire on the next successful
           cycle), then apply staleness to all OIDs immediately.
+          device_connection_downtime keeps ticking; device_connection_uptime is
+          written as 0.0.
         • Staleness (_apply_staleness) is called only for OIDs that were
           requested this cycle and did not respond (online path), or for all
           OIDs (offline path).  OIDs not due this cycle are never touched.
-        • Update device_state (1 = online, 0 = offline) in the store.
+        • Update device_state (1 = online, 0 = offline) and
+          device_connection_established in the store, both with
+          SourceTimestamp=wall_now.
         • Call write_variables() once at the end of every cycle.
 
         OID key resolution is cached after the first successful poll and
@@ -1582,16 +1580,26 @@ class SNMPPoller:
 
         # ── Empty cycle: no OIDs due this cycle ───────────────────────────────
         # Skip the GET entirely rather than sending a zero-OID request (whose
-        # behaviour is agent-dependent and likely wrong).  device_polling_age keeps
-        # ticking so OPC UA clients see time advancing; everything else is left
-        # untouched — we have no new information about the device this cycle.
+        # behaviour is agent-dependent and likely wrong).  device_connection_downtime
+        # and device_connection_uptime keep ticking so OPC UA clients see time
+        # advancing; everything else is left untouched — we have no new
+        # information about the device this cycle.
         if not due_oids:
             now = time.monotonic()
-            last_ts = self._store["device_polling_timestamp"].timestamp
-            if last_ts is not None:
-                self._store["device_polling_age"].data_value = ua.DataValue(
-                    ua.Variant(now - last_ts, ua.VariantType.Double)
-                )
+            wall_now_tick = datetime.datetime.now(datetime.timezone.utc)
+            elapsed = (now - self._last_state_change_at) if self._last_state_change_at is not None else 0.0
+            if self._was_offline:
+                downtime, uptime = elapsed, 0.0
+            else:
+                downtime, uptime = 0.0, elapsed
+            self._store["device_connection_downtime"].data_value = ua.DataValue(
+                Value=ua.Variant(downtime, ua.VariantType.Double),
+                SourceTimestamp=wall_now_tick,
+            )
+            self._store["device_connection_uptime"].data_value = ua.DataValue(
+                Value=ua.Variant(uptime, ua.VariantType.Double),
+                SourceTimestamp=wall_now_tick,
+            )
             await self.write_variables()
             return True
 
@@ -1622,20 +1630,30 @@ class SNMPPoller:
                     self._apply_staleness(oid_cfg.opcua_name, entry, now)
 
             self._store["device_state"].data_value = ua.DataValue(
-                ua.Variant(0, ua.VariantType.Int32)
+                Value=ua.Variant(0, ua.VariantType.Int32),
+                SourceTimestamp=wall_now,
             )
-            self._store["device_server_online"].data_value = ua.DataValue(
-                ua.Variant(False, ua.VariantType.Boolean)
+            self._store["device_connection_established"].data_value = ua.DataValue(
+                Value=ua.Variant(False, ua.VariantType.Boolean),
+                SourceTimestamp=wall_now,
             )
 
-            # device_polling_age keeps ticking even while offline using the initiation
-            # time of this cycle vs the timestamp of the last successful poll.
-            # device_polling_timestamp is NOT updated — it stays at the last success.
-            last_ts = self._store["device_polling_timestamp"].timestamp
-            if last_ts is not None:
-                self._store["device_polling_age"].data_value = ua.DataValue(
-                    ua.Variant(now - last_ts, ua.VariantType.Double)
-                )
+            # Stamp the state-change time on the first offline cycle so that
+            # downtime starts ticking from the moment of the transition.
+            if not self._was_offline or self._last_state_change_at is None:
+                self._last_state_change_at = now
+
+            # device_connection_downtime keeps ticking while offline;
+            # device_connection_uptime is 0.0 while offline.
+            downtime = now - self._last_state_change_at
+            self._store["device_connection_downtime"].data_value = ua.DataValue(
+                Value=ua.Variant(downtime, ua.VariantType.Double),
+                SourceTimestamp=wall_now,
+            )
+            self._store["device_connection_uptime"].data_value = ua.DataValue(
+                Value=ua.Variant(0.0, ua.VariantType.Double),
+                SourceTimestamp=wall_now,
+            )
 
             await self.write_variables()
             return False
@@ -1644,6 +1662,7 @@ class SNMPPoller:
         if self._was_offline:
             log.warning("Device came online: %s — resolving OID keys", self.host)
             self._oid_key_cache.clear()
+            self._last_state_change_at = now
             for oid_cfg in self.oids:
                 key = self._resolve_oid_key(oid_cfg, results)
                 if key is not None:
@@ -1686,7 +1705,10 @@ class SNMPPoller:
 
             entry = self._store[oid_cfg.opcua_name]
             if isinstance(variant, ua.Variant):
-                entry.data_value = ua.DataValue(variant)
+                entry.data_value = ua.DataValue(
+                    Value=variant,
+                    SourceTimestamp=wall_now,
+                )
             else:
                 entry.data_value = variant   # already a DataValue (cast failed)
             entry.timestamp = now
@@ -1706,29 +1728,26 @@ class SNMPPoller:
                 if entry is not None:
                     self._apply_staleness(oid_cfg.opcua_name, entry, now)
 
-        # ── Update device_polling_timestamp and device_polling_age on success ─────
-        # Stamped with the initiation time of this cycle (now/wall_now), so
-        # device_polling_age resets to ~0.0 on success and device_polling_timestamp
-        # reflects when the request was sent rather than when the response arrived.
-        self._store["device_polling_timestamp"].data_value = ua.DataValue(
-            ua.Variant(wall_now, ua.VariantType.DateTime)
+        # ── Update connection builtins on success ─────────────────────────────
+        # downtime resets to 0.0 while connected; uptime ticks from the last
+        # online transition recorded in _last_state_change_at.
+        self._store["device_connection_downtime"].data_value = ua.DataValue(
+            Value=ua.Variant(0.0, ua.VariantType.Double),
+            SourceTimestamp=wall_now,
         )
-        self._store["device_polling_timestamp"].timestamp = now
-        self._store["device_polling_age"].data_value = ua.DataValue(
-            ua.Variant(0.0, ua.VariantType.Double)
+        uptime = (now - self._last_state_change_at) if self._last_state_change_at is not None else 0.0
+        self._store["device_connection_uptime"].data_value = ua.DataValue(
+            Value=ua.Variant(uptime, ua.VariantType.Double),
+            SourceTimestamp=wall_now,
         )
-        self._store["device_polling_age"].timestamp = now
 
         self._store["device_state"].data_value = ua.DataValue(
-            ua.Variant(1, ua.VariantType.Int32)
+            Value=ua.Variant(1, ua.VariantType.Int32),
+            SourceTimestamp=wall_now,
         )
-        self._store["device_server_online"].data_value = ua.DataValue(
-            ua.Variant(True, ua.VariantType.Boolean)
-        )
-        # Increment success counter, wrapping at UInt32 max.
-        prev = self._store["device_polling_success_count"].data_value.Value.Value
-        self._store["device_polling_success_count"].data_value = ua.DataValue(
-            ua.Variant((prev + 1) & 0xFFFFFFFF, ua.VariantType.UInt32)
+        self._store["device_connection_established"].data_value = ua.DataValue(
+            Value=ua.Variant(True, ua.VariantType.Boolean),
+            SourceTimestamp=wall_now,
         )
         await self.write_variables()
         return True
@@ -1975,35 +1994,38 @@ class OPCUAServer:
         Each line reports:
           • opcua_path  — the poller's OPC UA path (device identity)
           • host        — SNMP device IP
-          • online      — current device_server_online value
-          • polls       — cumulative successful SNMP poll count
-          • age         — seconds since last successful poll (or "never")
+          • online      — current device_connection_established value
+          • downtime    — seconds since last successful poll (or "never")
+          • uptime      — seconds since device last came online (or "offline")
         """
         await asyncio.sleep(self._HEARTBEAT_INTERVAL)
         while True:
             for poller in self._pollers:
                 store = poller._store
-                online_entry = store.get("device_server_online")
-                count_entry  = store.get("device_polling_success_count")
-                age_entry    = store.get("device_polling_age")
+                online_entry    = store.get("device_connection_established")
+                downtime_entry  = store.get("device_connection_downtime")
+                uptime_entry    = store.get("device_connection_uptime")
 
                 online = (
                     online_entry.data_value.Value.Value
                     if online_entry and online_entry.data_value.Value else "?"
                 )
-                count = (
-                    int(count_entry.data_value.Value.Value)
-                    if count_entry and count_entry.data_value.Value else "?"
+                downtime_val = (
+                    downtime_entry.data_value.Value.Value
+                    if downtime_entry and downtime_entry.data_value.Value else None
                 )
-                age_val = (
-                    age_entry.data_value.Value.Value
-                    if age_entry and age_entry.data_value.Value else None
+                uptime_val = (
+                    uptime_entry.data_value.Value.Value
+                    if uptime_entry and uptime_entry.data_value.Value else None
                 )
-                age_str = f"{age_val:.1f}s ago" if isinstance(age_val, float) else "never"
+                if online is True:
+                    connection_str = f"uptime={uptime_val:.1f}s" if isinstance(uptime_val, float) else "uptime=?"
+                else:
+                    connection_str = f"downtime={downtime_val:.1f}s" if isinstance(downtime_val, float) else "downtime=never"
 
                 log.info(
-                    "Heartbeat: %s (%s)  online=%s  polls=%s  last_poll=%s",
-                    poller.opcua_path, poller.host, online, count, age_str,
+                    "Heartbeat: %s (%s)  online=%s  %s",
+                    poller.opcua_path, poller.host, online, connection_str,
                 )
             await asyncio.sleep(self._HEARTBEAT_INTERVAL)
 
