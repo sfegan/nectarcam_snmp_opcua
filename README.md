@@ -1,4 +1,4 @@
-# nectarcam_snmp_opcua
+# NectarCAM SNMP OPC UA Server
 
 OPC UA server bridge for NectarCAM SNMP devices
 
