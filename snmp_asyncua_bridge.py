@@ -24,6 +24,7 @@ Each SNMPPoller is built from a dict like:
         "description": "Main distribution switch, rack A",  # optional, defaults to ""
         "opcua_path":  "Switch01",      # relative to --opcua-root (or Objects/ if root is empty)
         "poll_interval": 10,            # optional, defaults to 10 (seconds)
+        "backoff_interval": 60,         # optional; max interval (seconds) between connection attempts when offline
         "snmp_timeout":  2.0,           # optional, defaults to 2.0 (seconds per attempt)
         "snmp_retries":  1,             # optional, defaults to 1
         "default_lifetime": 30, # optional; per-OID default for lifetime (0 = never expire)
@@ -595,6 +596,16 @@ class SNMPPoller:
       • device_connected   (Boolean) – True when SNMP agent is reachable; never modified by subclasses
       • device_state                    (Int32)   – 0 = offline, 1 = online (may be overridden by subclasses)
 
+    Exponential backoff (offline state)
+    -----------------------------------
+    When a device is offline, the poller applies exponential backoff to connection
+    attempts to avoid network spam.  The delay between attempts starts at 1 cycle
+    and doubles each failed attempt up to a maximum defined by `backoff_interval`.
+    During backoff cycles, no SNMP traffic is sent for the device and OIDs are
+    skipped.  The delay is reset to 1 cycle as soon as the device responds.
+    The `backoff_interval` configuration item defines the maximum allowed
+    interval (in seconds) between connection attempts.
+
     OID variables whose ``opcua_name`` begins with ``"_"`` are *local*: they are
     polled from SNMP and stored in the internal data store but no OPC UA node is
     created for them.  Subclasses can read them from ``self._store`` to compute
@@ -679,6 +690,7 @@ class SNMPPoller:
     description: str          # human-readable device description (written to OPC UA object)
     opcua_path: str           # dot-separated path relative to root, e.g. "Switch01"
     poll_interval: float      # seconds
+    backoff_interval: float = 0.0 # optional; max interval (seconds) between connection attempts when offline
     oids: List[OIDConfig]
     constants: List[ConstantConfig] = field(default_factory=list)
     snmp_timeout: float = 2.0   # seconds per SNMP request attempt
@@ -738,6 +750,9 @@ class SNMPPoller:
     # Used to compute device_connection_uptime (when online) and
     # device_connection_downtime (when offline).
     _last_state_change_at: Optional[float] = field(default=None, init=False, repr=False)
+    # Current reconnection delay in cycles, used for exponential backoff when
+    # the device is offline.
+    _reconnection_delay: int = field(default=1, init=False, repr=False)
 
     # ─────────────────────────────────────────────────────────────────────────
 
@@ -745,6 +760,11 @@ class SNMPPoller:
         if self.poll_interval <= 0:
             raise ValueError(
                 f"poll_interval must be > 0, got {self.poll_interval!r} "
+                f"for poller {self.opcua_path!r}"
+            )
+        if self.backoff_interval < 0:
+            raise ValueError(
+                f"backoff_interval must be >= 0, got {self.backoff_interval!r} "
                 f"for poller {self.opcua_path!r}"
             )
         if self.snmp_timeout <= 0:
@@ -826,6 +846,7 @@ class SNMPPoller:
             description=cfg.get("description", ""),
             opcua_path=cfg["opcua_path"],
             poll_interval=float(cfg.get("poll_interval", 10)),
+            backoff_interval=float(cfg.get("backoff_interval", 0.0)),
             snmp_timeout=float(cfg.get("snmp_timeout", 2.0)),
             snmp_retries=int(cfg.get("snmp_retries", 1)),
             oids=oids,
@@ -852,6 +873,7 @@ class SNMPPoller:
             "description":      self.description,
             "opcua_path":       self.opcua_path,
             "poll_interval":    self.poll_interval,
+            "backoff_interval": self.backoff_interval,
             "snmp_timeout":     self.snmp_timeout,
             "snmp_retries":     self.snmp_retries,
             "default_lifetime": self.default_lifetime,
@@ -1622,6 +1644,14 @@ class SNMPPoller:
             now = time.monotonic()
             wall_now_tick = datetime.datetime.now(datetime.timezone.utc)
             elapsed = (now - self._last_state_change_at) if self._last_state_change_at is not None else 0.0
+            self._store["device_state"].data_value = ua.DataValue(
+                Value=ua.Variant(0 if self._was_offline else 1, ua.VariantType.Int32),
+                SourceTimestamp=wall_now,
+            )
+            self._store["device_connected"].data_value = ua.DataValue(
+                Value=ua.Variant(self._was_offline, ua.VariantType.Boolean),
+                SourceTimestamp=wall_now,
+            )
             if self._was_offline:
                 downtime, uptime = elapsed, 0.0
             else:
@@ -1645,16 +1675,22 @@ class SNMPPoller:
                 log.warning("Device went offline: %s", self.host)
                 self._oid_key_cache.clear()
                 self._was_offline = True
+                self._reconnection_delay = 1
+            else:
+                # Already offline, increase backoff
+                max_delay = max(1, int(self.backoff_interval / self.poll_interval))
+                self._reconnection_delay = min(max_delay, self._reconnection_delay * 2)
 
-            log.debug("Device offline: %s", self.host)
+            log.debug("Device offline: %s (next connection attempt in %d cycles)",
+                      self.host, self._reconnection_delay)
 
-            # Reset next_cycle for all OIDs to _polling_cycle so they all fire
-            # together on the next successful cycle.  PLL phasing for slow-polled
-            # OIDs resets at this point — this is intentional.
+            # Reset next_cycle for all OIDs to _polling_cycle + _reconnection_delay
+            # so they all fire together after the backoff period.
+            # PLL phasing for slow-polled OIDs resets at this point — this is intentional.
             for oid_cfg in self.oids:
                 entry = self._store.get(oid_cfg.opcua_name)
                 if entry is not None:
-                    entry.next_cycle = self._polling_cycle
+                    entry.next_cycle = self._polling_cycle + self._reconnection_delay
 
             # Apply staleness to all OIDs immediately — we don't know the state
             # of any variable when the device is unreachable.
@@ -1697,6 +1733,7 @@ class SNMPPoller:
             log.warning("Device came online: %s — resolving OID keys", self.host)
             self._oid_key_cache.clear()
             self._last_state_change_at = now
+            self._reconnection_delay = 1
             for oid_cfg in self.oids:
                 key = self._resolve_oid_key(oid_cfg, results)
                 if key is not None:

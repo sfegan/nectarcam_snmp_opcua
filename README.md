@@ -97,6 +97,7 @@ Each device configuration is a JSON object with the following fields:
 - `description` (string, optional): Human-readable description of the device
 - `opcua_path` (string): Dot-separated OPC UA path relative to the root container (set by `--opcua-root`), e.g., `"Switch01"` or `"Switch.Monitoring"`. For multi-IP configurations, use `{instance}` for substitution.
 - `poll_interval` (number, optional): Polling interval in seconds (default: value of `--default-poll-interval`, which defaults to 10.0)
+- `backoff_interval` (number, optional): Maximum interval in seconds between connection attempts when the device is offline. The poller uses exponential backoff starting at 1 cycle and doubling up to this limit. Set to `0` (default) to disable backoff and retry every cycle.
 - `snmp_timeout` (number, optional): SNMP request timeout in seconds (per attempt) (default: value of `--snmp-timeout`)
 - `snmp_retries` (integer, optional): Number of SNMP retries after the first attempt (default: value of `--snmp-retries`)
 - `default_lifetime` (number, optional): Default lifetime in seconds for OID variables that do not specify their own `lifetime`. `0` means never expire (default: 0).
