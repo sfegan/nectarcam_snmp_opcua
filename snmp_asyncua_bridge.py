@@ -690,11 +690,11 @@ class SNMPPoller:
     description: str          # human-readable device description (written to OPC UA object)
     opcua_path: str           # dot-separated path relative to root, e.g. "Switch01"
     poll_interval: float      # seconds
-    backoff_interval: float = 0.0 # optional; max interval (seconds) between connection attempts when offline
     oids: List[OIDConfig]
     constants: List[ConstantConfig] = field(default_factory=list)
     snmp_timeout: float = 2.0   # seconds per SNMP request attempt
     snmp_retries: int = 1       # number of retries after the first attempt
+    backoff_interval: float = 0.0 # optional; max interval (seconds) between connection attempts when offline
     # Default lifetime (seconds) for OID variables that do not specify their own.
     # 0 means variables with lifetime=-1 never expire.
     default_lifetime: float = 0.0
