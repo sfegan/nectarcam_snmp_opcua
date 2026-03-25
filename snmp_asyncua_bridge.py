@@ -5,98 +5,44 @@ SNMP → OPC UA bridge using pysnmp (SNMPv2c) and asyncua.
 
 Usage
 -----
-python snmp_asyncua_bridge.py \
-    --opcua-endpoint opc.tcp://0.0.0.0:4840/nectarcam/ \
-    --opcua-namespace http://cta-observatory.org/nectarcam/snmpdevices/ \
-    --opcua-root SNMPDevices \
-    --opcua-user admin:secret \
-    --log-level INFO \
-    --log-file bridge.log
+python snmp_asyncua_bridge.py --device-config config.json
 
-Configuration example
----------------------
-Each SNMPPoller is built from a dict like:
+Device Configuration (JSON)
+---------------------------
+Each device is defined by an object like:
 
     {
-        "host":        "192.168.1.10",
-        "port":        161,             # optional, defaults to 161
-        "community":   "public",        # optional, defaults to "public"
-        "description": "Main distribution switch, rack A",  # optional, defaults to ""
-        "opcua_path":  "Switch01",      # relative to --opcua-root (or Objects/ if root is empty)
-        "poll_interval": 10,            # optional, defaults to 10 (seconds)
-        "backoff_interval": 60,         # optional; max interval (seconds) between connection attempts when offline
-        "snmp_timeout":  2.0,           # optional, defaults to 2.0 (seconds per attempt)
-        "snmp_retries":  1,             # optional, defaults to 1
-        "default_lifetime": 30, # optional; per-OID default for lifetime (0 = never expire)
-        "oids_per_get":  1,     # optional; max OIDs per SNMP GET request:
-                                #   -1 (default) → use the server-wide default (--default-oids-per-get)
-                                #    0            → unlimited (all due OIDs in one request)
-                                #   >0            → at most this many OIDs per GET (batched)
+        "host":        "192.168.1.10",  # String or array of strings
+        "port":        161,             # optional (default 161)
+        "community":   "public",        # optional (default "public")
+        "description": "Device info",   # optional (default "")
+        "opcua_path":  "MyDevice",      # relative to --opcua-root
+        "poll_interval": 10,            # seconds (default 10)
+        "backoff_interval": 60,         # max backoff seconds (default 0)
+        "snmp_timeout":  2.0,           # seconds per attempt (default 2.0)
+        "snmp_retries":  1,             # retries after first attempt (default 1)
         "oids": [
             {
-                "oid":         "1.3.6.1.2.1.1.1.0",   # sysDescr  (dotted-decimal)
-                "opcua_name":  "sysDescr",
-                "opcua_type":  "String",
-                "description": "System description",   # optional, defaults to ""
-                "poll_every":  5,                      # optional; read every 5 cycles (default 1)
-            },
-            {
-                "oid":         "SNMPv2-MIB::sysUpTime.0",   # symbolic name also accepted
-                "opcua_name":  "sysUpTime",
-                "opcua_type":  "UInt32",
-                "description": "System uptime in hundredths of a second",
-                                                       # poll_every defaults to 1 (every cycle)
-            },
+                "oid":        "1.3.6.1.2.1.1.1.0",
+                "opcua_name": "sysDescr",
+                "opcua_type": "String",
+                "poll_every": 5         # read every 5 cycles (default 1)
+            }
         ],
-        "constants": [                          # optional; written once at startup
+        "constants": [                  # optional; written once at startup
             {
-                "opcua_name":  "SoftwareVersion",
-                "opcua_type":  "String",
-                "value":       "2.0.0",
-                "description": "Firmware version of the device",   # optional
-            },
-        ],
+                "opcua_name": "Firmware",
+                "opcua_type": "String",
+                "value":      "1.2.3"
+            }
+        ]
     }
 
-OPC UA root path (--opcua-root)
---------------------------------
-Controls the container node(s) created above every device object:
+Multi-IP expansion: when "host" is an array, one poller is created per address.
+{instance} in "opcua_path" and "description" is replaced with the index.
 
-  --opcua-root SNMPDevices        → Objects/SNMPDevices/Switch01  (default)
-  --opcua-root Camera0.SNMPDevices → Objects/Camera0/SNMPDevices/Switch01
-  --opcua-root ""                  → Objects/Switch01  (devices directly under Objects/)
-
-The value is split on "." so each segment becomes one Object node level.
-Passing an empty string (or omitting the flag and passing "") places devices
-directly under the server's Objects/ node with no intermediate container.
-
-Supported opcua_type values
----------------------------
-  Boolean, SByte, Byte, Int16, UInt16, Int32, UInt32,
-  Int64, UInt64, Float, Double, String, ByteString, DateTime
-
-Multiple identical devices (ip array)
---------------------------------------
-When "host" is a JSON array of strings, one SNMPPoller is created per
-address.  The fields "opcua_path" and "description" may contain the
-placeholder {instance}, which is replaced with the zero-based index of
-the address in the array using Python str.format_map(), so any format
-spec is valid:
-
-    "host":       ["192.168.1.10", "192.168.1.11", "192.168.1.12"],
-    "opcua_path": "Switch{instance:02d}",
-    "description": "Distribution switch {instance}",
-
-If "host" is an array and "opcua_path" does not contain {instance}, a
-warning is logged and "_{instance}" is appended automatically as a fallback.
-
-Within each entry in "constants", {instance} is substituted into the
-"value" field (when it is a string) and the "description" field, allowing
-per-device metadata such as serial numbers or slot identifiers:
-
-    "constants": [{"opcua_name": "SlotIndex", "opcua_type": "UInt16",
-                   "value": "{instance}",
-                   "description": "Physical slot {instance}"}]
+Supported OPC UA types: Boolean, SByte, Byte, Int16, UInt16, Int32, UInt32,
+Int64, UInt64, Float, Double, String, ByteString, DateTime.
 """
 
 from __future__ import annotations
@@ -1414,66 +1360,38 @@ class SNMPPoller:
 
     async def run(self) -> None:
         """
-        Phase-locked polling loop.  Must be called after the OPC UA nodes have
-        been created (i.e. after OPCUAServer.build_address_space()).
+        Phase-locked polling loop.
 
-        Slot skipping
-        -------------
-        Each cycle occupies one slot of duration ``poll_interval``.  If a poll
-        overruns into future slots, every overrun slot is logged and skipped so
-        the loop re-locks to the correct phase rather than firing repeatedly to
-        catch up.
-
-        Concurrent-poll guard
-        ---------------------
-        If a poll is still in progress when the next slot fires (possible when
-        ``snmp_timeout * (snmp_retries + 1) > poll_interval``), the new slot is
-        skipped entirely — no store updates, no OPC UA writes.  The in-flight
-        poll is left to complete and will handle all staleness updates itself.
+        Each cycle occupies one slot of duration ``poll_interval``. If a poll
+        overruns, future slots are skipped to re-lock to the correct phase.
+        If a poll is still in progress when the next slot fires, that slot
+        is skipped entirely.
         """
-        log.info("Poller started: %s  path=%s  interval=%.1fs  timeout=%.1fs  retries=%d",
-                 self.host, self.opcua_path, self.poll_interval,
-                 self.snmp_timeout, self.snmp_retries)
-        log.info("Waiting for device to respond: %s", self.host)
+        log.info("Poller started: %s  path=%s  interval=%.1fs",
+                 self.host, self.opcua_path, self.poll_interval)
 
         loop = asyncio.get_running_loop()
         origin = loop.time()
         cycle = 0
 
         while True:
-            # ── Fire the poll, or skip if the previous one is still in flight ──
             log.debug("Poller %s: starting slot %d", self.host, cycle + 1)
             if self._poll_lock.locked():
-                log.warning("Poller %s: slot %d skipped — previous poll still in flight",
+                log.warning("Poller %s: slot %d skipped — previous poll in flight",
                             self.host, cycle + 1)
-                poll_ran = False
-                was_offline = self._was_offline
             else:
-                was_offline = self._was_offline
-                # Update _polling_cycle *before* calling _poll_once so that
-                # next_cycle comparisons inside the poll see the correct value.
-                # _polling_cycle is only advanced here — never on a skipped slot.
                 self._polling_cycle = cycle + 1
                 async with self._poll_lock:
                     await self._poll_once()
-                poll_ran = True
 
-            # ── Advance cycle until the next deadline is in the future ──────────
+            # Advance cycle to the next future deadline
             cycle += 1
             now = loop.time()
             while origin + cycle * self.poll_interval <= now:
-                if not poll_ran or was_offline or self._was_offline:
-                    log.debug("Poller %s: skipping overrun slot %d (device offline)",
-                              self.host, cycle + 1)
-                else:
-                    log.warning("Poller %s: skipping overrun slot %d",
-                                self.host, cycle + 1)
+                log.debug("Poller %s: skipping overrun slot %d", self.host, cycle + 1)
                 cycle += 1
 
-            # ── Sleep until the start of the next slot ────────────────────────
             sleep_for = origin + cycle * self.poll_interval - now
-            log.debug("Poller %s: sleeping %.3fs until slot %d",
-                      self.host, sleep_for, cycle + 1)
             await asyncio.sleep(sleep_for)
 
     def _resolve_oid_key(self, oid_cfg: OIDConfig, results: Dict[str, Any]) -> Optional[str]:
@@ -1556,270 +1474,132 @@ class SNMPPoller:
                 StatusCode_=_uncertain,
             )
 
-    async def _poll_once(self, force_full: bool = False) -> bool:
-        """
-        Fetch OIDs from the device, update the internal data store, then call
-        write_variables() to push the entire store to OPC UA.
-
-        Parameters
-        ----------
-        force_full : bool
-            When True, request *all* configured OIDs regardless of their
-            ``next_cycle`` schedule.  ``next_cycle`` is never advanced and
-            ``_polling_cycle`` is never changed, so the PLL schedule is
-            undisturbed.  Intended for use by ``force_reload()`` only.
-            When False (default), only OIDs whose ``next_cycle <=
-            _polling_cycle`` are requested; ``next_cycle`` is advanced for
-            each OID that responds successfully.
-
-        Returns
-        -------
-        bool
-            True if the device responded (results were received); False if the
-            device was unreachable this cycle.
-
-        Responsibilities
-        ----------------
-        • Build the per-cycle OID request list from due variables (or all OIDs
-          when force_full=True).
-        • On a successful response: update store entries for every OID that
-          replied with SourceTimestamp=wall_now; resolve and cache OID keys on
-          the first post-offline cycle; advance next_cycle for each responding
-          OID (scheduled polls only).  Reset device_connection_downtime to 0.0
-          and update device_connection_uptime.
-        • On a failed response (device offline): reset next_cycle to
-          _polling_cycle for all OIDs (so they all fire on the next successful
-          cycle), then apply staleness to all OIDs immediately.
-          device_connection_downtime keeps ticking; device_connection_uptime is
-          written as 0.0.
-        • Staleness (_apply_staleness) is called only for OIDs that were
-          requested this cycle and did not respond (online path), or for all
-          OIDs (offline path).  OIDs not due this cycle are never touched.
-        • Update device_state (1 = online, 0 = offline) and
-          device_connected in the store, both with
-          SourceTimestamp=wall_now.
-        • Call write_variables() once at the end of every cycle.
-
-        OID key resolution is cached after the first successful poll and
-        cleared when the device goes offline so keys are re-resolved on
-        recovery.
-
-        Locking
-        -------
-        Does NOT acquire _poll_lock.  Callers (run() and force_reload()) are
-        responsible for holding the lock around this call.
-        """
+    def _update_connection_metrics(self, is_online: bool) -> None:
+        """Update built-in connection metrics in the store."""
         now = time.monotonic()
         wall_now = datetime.datetime.now(datetime.timezone.utc)
 
-        # ── Clear per-cycle freshness flag on all OID entries ─────────────────
-        # Done unconditionally before the GET so write_variables() always sees a
-        # consistent state regardless of whether this is a scheduled poll, a
-        # force_full, or a cycle where the device turns out to be offline.
+        if not self._last_state_change_at:
+            self._last_state_change_at = now
+
+        elapsed = now - self._last_state_change_at
+        downtime = elapsed if not is_online else 0.0
+        uptime = elapsed if is_online else 0.0
+
+        for name, val in [
+            ("device_connection_downtime", downtime),
+            ("device_connection_uptime",   uptime),
+            ("device_state",               1 if is_online else 0),
+            ("device_connected",           is_online),
+        ]:
+            self._store[name].data_value = ua.DataValue(
+                Value=ua.Variant(val, self._store[name].data_value.Value.VariantType),
+                SourceTimestamp=wall_now,
+            )
+
+    def _handle_offline_state(self) -> None:
+        """Process logic for an offline device cycle."""
+        if not self._was_offline:
+            log.warning("Device went offline: %s", self.host)
+            self._oid_key_cache.clear()
+            self._was_offline = True
+            self._last_state_change_at = time.monotonic()
+            self._reconnection_delay = 1
+        else:
+            max_delay = max(1, int(self.backoff_interval / self.poll_interval))
+            self._reconnection_delay = min(max_delay, self._reconnection_delay * 2)
+
+        log.debug("Device offline: %s (backoff: %d cycles)", self.host, self._reconnection_delay)
+
+        # Skip future cycles for all OIDs
         for oid_cfg in self.oids:
-            entry = self._store.get(oid_cfg.opcua_name)
-            if entry is not None:
+            entry = self._store[oid_cfg.opcua_name]
+            entry.next_cycle = self._polling_cycle + self._reconnection_delay
+            self._apply_staleness(oid_cfg.opcua_name, entry, time.monotonic())
+
+        self._update_connection_metrics(False)
+
+    def _handle_online_transition(self, results: Dict[str, Any]) -> None:
+        """Resolve OID keys when device first responds after being offline."""
+        log.warning("Device came online: %s — resolving OID keys", self.host)
+        self._oid_key_cache.clear()
+        self._was_offline = False
+        self._last_state_change_at = time.monotonic()
+        self._reconnection_delay = 1
+
+        for cfg in self.oids:
+            key = self._resolve_oid_key(cfg, results)
+            if key:
+                self._oid_key_cache[cfg.opcua_name] = key
+            else:
+                log.warning("OID not supported: %s on %s", cfg.oid, self.host)
+                entry = self._store[cfg.opcua_name]
+                entry.data_value = ua.DataValue(
+                    Value=ua.Variant(_UA_TYPE_ZEROS.get(entry.opcua_type, ""),
+                                     _UA_TYPE_MAP[entry.opcua_type][0]),
+                    StatusCode_=ua.StatusCode(ua.StatusCodes.BadNotSupported),
+                )
+
+    def _process_snmp_results(self, results: Dict[str, Any], due_oids: List[OIDConfig], force_full: bool) -> None:
+        """Store OID values and handle staleness for non-responding due OIDs."""
+        now = time.monotonic()
+        wall_now = datetime.datetime.now(datetime.timezone.utc)
+        responded = set()
+
+        for cfg in due_oids:
+            key = self._oid_key_cache.get(cfg.opcua_name)
+            if not key or key not in results:
+                continue
+
+            val = _snmp_value_to_python(results[key])
+            variant = _cast_to_ua(val, cfg.opcua_type)
+            entry = self._store[cfg.opcua_name]
+
+            if isinstance(variant, ua.Variant):
+                entry.data_value = ua.DataValue(Value=variant, SourceTimestamp=wall_now)
+            else:
+                entry.data_value = variant  # cast failed (DataValue with Bad status)
+
+            entry.timestamp = now
+            entry.updated_this_cycle = True
+            responded.add(cfg.opcua_name)
+
+            if not force_full:
+                entry.next_cycle = self._polling_cycle + cfg.poll_every
+
+        # Apply staleness only to due OIDs that failed to respond
+        for cfg in due_oids:
+            if cfg.opcua_name not in responded and self._oid_key_cache.get(cfg.opcua_name):
+                self._apply_staleness(cfg.opcua_name, self._store[cfg.opcua_name], now)
+
+    async def _poll_once(self, force_full: bool = False) -> bool:
+        """
+        Single polling cycle: fetch OIDs, update store, and write to OPC UA.
+        """
+        for cfg in self.oids:
+            if entry := self._store.get(cfg.opcua_name):
                 entry.updated_this_cycle = False
 
-        # ── Build the set of OIDs to request this cycle ───────────────────────
-        if force_full:
-            due_oids = self.oids
-        else:
-            due_oids = [
-                oid_cfg for oid_cfg in self.oids
-                if self._store[oid_cfg.opcua_name].next_cycle <= self._polling_cycle
-            ]
+        due_oids = self.oids if force_full else [
+            o for o in self.oids if self._store[o.opcua_name].next_cycle <= self._polling_cycle
+        ]
 
-        log.debug("Poller %s: cycle %d — requesting %d/%d OID(s)%s",
-                  self.host, self._polling_cycle, len(due_oids), len(self.oids),
-                  " (force_full)" if force_full else "")
-
-        # ── Empty cycle: no OIDs due this cycle ───────────────────────────────
-        # Skip the GET entirely rather than sending a zero-OID request (whose
-        # behaviour is agent-dependent and likely wrong).  device_connection_downtime
-        # and device_connection_uptime keep ticking so OPC UA clients see time
-        # advancing; everything else is left untouched — we have no new
-        # information about the device this cycle.
         if not due_oids:
-            now = time.monotonic()
-            wall_now_tick = datetime.datetime.now(datetime.timezone.utc)
-            elapsed = (now - self._last_state_change_at) if self._last_state_change_at is not None else 0.0
-            self._store["device_state"].data_value = ua.DataValue(
-                Value=ua.Variant(0 if self._was_offline else 1, ua.VariantType.Int32),
-                SourceTimestamp=wall_now,
-            )
-            self._store["device_connected"].data_value = ua.DataValue(
-                Value=ua.Variant(self._was_offline, ua.VariantType.Boolean),
-                SourceTimestamp=wall_now,
-            )
-            if self._was_offline:
-                downtime, uptime = elapsed, 0.0
-            else:
-                downtime, uptime = 0.0, elapsed
-            self._store["device_connection_downtime"].data_value = ua.DataValue(
-                Value=ua.Variant(downtime, ua.VariantType.Double),
-                SourceTimestamp=wall_now_tick,
-            )
-            self._store["device_connection_uptime"].data_value = ua.DataValue(
-                Value=ua.Variant(uptime, ua.VariantType.Double),
-                SourceTimestamp=wall_now_tick,
-            )
+            self._update_connection_metrics(not self._was_offline)
             await self.write_variables()
             return True
 
         results = await self._get_all_oids(due_oids, self.oids_per_get)
-
         if results is None:
-            # ── Device offline ────────────────────────────────────────────────
-            if not self._was_offline:
-                log.warning("Device went offline: %s", self.host)
-                self._oid_key_cache.clear()
-                self._was_offline = True
-                self._reconnection_delay = 1
-            else:
-                # Already offline, increase backoff
-                max_delay = max(1, int(self.backoff_interval / self.poll_interval))
-                self._reconnection_delay = min(max_delay, self._reconnection_delay * 2)
-
-            log.debug("Device offline: %s (next connection attempt in %d cycles)",
-                      self.host, self._reconnection_delay)
-
-            # Reset next_cycle for all OIDs to _polling_cycle + _reconnection_delay
-            # so they all fire together after the backoff period.
-            # PLL phasing for slow-polled OIDs resets at this point — this is intentional.
-            for oid_cfg in self.oids:
-                entry = self._store.get(oid_cfg.opcua_name)
-                if entry is not None:
-                    entry.next_cycle = self._polling_cycle + self._reconnection_delay
-
-            # Apply staleness to all OIDs immediately — we don't know the state
-            # of any variable when the device is unreachable.
-            for oid_cfg in self.oids:
-                entry = self._store.get(oid_cfg.opcua_name)
-                if entry is not None:
-                    self._apply_staleness(oid_cfg.opcua_name, entry, now)
-
-            self._store["device_state"].data_value = ua.DataValue(
-                Value=ua.Variant(0, ua.VariantType.Int32),
-                SourceTimestamp=wall_now,
-            )
-            self._store["device_connected"].data_value = ua.DataValue(
-                Value=ua.Variant(False, ua.VariantType.Boolean),
-                SourceTimestamp=wall_now,
-            )
-
-            # Stamp the state-change time on the first offline cycle so that
-            # downtime starts ticking from the moment of the transition.
-            if not self._was_offline or self._last_state_change_at is None:
-                self._last_state_change_at = now
-
-            # device_connection_downtime keeps ticking while offline;
-            # device_connection_uptime is 0.0 while offline.
-            downtime = now - self._last_state_change_at
-            self._store["device_connection_downtime"].data_value = ua.DataValue(
-                Value=ua.Variant(downtime, ua.VariantType.Double),
-                SourceTimestamp=wall_now,
-            )
-            self._store["device_connection_uptime"].data_value = ua.DataValue(
-                Value=ua.Variant(0.0, ua.VariantType.Double),
-                SourceTimestamp=wall_now,
-            )
-
+            self._handle_offline_state()
             await self.write_variables()
             return False
 
-        # ── Device is responding ──────────────────────────────────────────────
         if self._was_offline:
-            log.warning("Device came online: %s — resolving OID keys", self.host)
-            self._oid_key_cache.clear()
-            self._last_state_change_at = now
-            self._reconnection_delay = 1
-            for oid_cfg in self.oids:
-                key = self._resolve_oid_key(oid_cfg, results)
-                if key is not None:
-                    self._oid_key_cache[oid_cfg.opcua_name] = key
-                    log.debug("  OID resolved: %s -> %s (%s)",
-                              oid_cfg.oid, key, oid_cfg.opcua_name)
-                else:
-                    log.warning(
-                        "OID not supported by device – marking BadNotSupported: "
-                        "%s on %s", oid_cfg.oid, self.host,
-                    )
-                    entry = self._store[oid_cfg.opcua_name]
-                    entry.data_value = ua.DataValue(
-                        Value=ua.Variant(
-                            _UA_TYPE_ZEROS.get(entry.opcua_type, ""),
-                            _UA_TYPE_MAP[entry.opcua_type][0],
-                        ),
-                        StatusCode_=ua.StatusCode(ua.StatusCodes.BadNotSupported),
-                    )
-            self._was_offline = False
+            self._handle_online_transition(results)
 
-        # ── Update store entries for OIDs present in the response ─────────────
-        responded: set[str] = set()
-        for oid_cfg in due_oids:
-            key = self._oid_key_cache.get(oid_cfg.opcua_name)
-            if key is None:
-                continue    # marked BadNotSupported on coming online
-
-            raw = results.get(key)
-            if raw is None:
-                log.warning("Cached OID key no longer in response: %s on %s",
-                            key, self.host)
-                continue
-
-            py_val = _snmp_value_to_python(raw)
-            variant = _cast_to_ua(py_val, oid_cfg.opcua_type)
-            log.debug("  Read %s.%s = %r (raw type: %s)",
-                      self.opcua_path, oid_cfg.opcua_name,
-                      py_val, type(raw).__name__)
-
-            entry = self._store[oid_cfg.opcua_name]
-            if isinstance(variant, ua.Variant):
-                entry.data_value = ua.DataValue(
-                    Value=variant,
-                    SourceTimestamp=wall_now,
-                )
-            else:
-                entry.data_value = variant   # already a DataValue (cast failed)
-            entry.timestamp = now
-            entry.updated_this_cycle = True
-            responded.add(oid_cfg.opcua_name)
-
-            # Advance next_cycle for scheduled polls only — force_full never
-            # advances next_cycle so the PLL schedule is undisturbed.
-            if not force_full:
-                entry.next_cycle = self._polling_cycle + oid_cfg.poll_every
-
-        # ── Apply staleness to due OIDs that did not respond this cycle ───────
-        # Only due_oids are candidates — non-due OIDs are left entirely untouched.
-        for oid_cfg in due_oids:
-            if oid_cfg.opcua_name not in responded                     and self._oid_key_cache.get(oid_cfg.opcua_name) is not None:
-                entry = self._store.get(oid_cfg.opcua_name)
-                if entry is not None:
-                    self._apply_staleness(oid_cfg.opcua_name, entry, now)
-
-        # ── Update connection builtins on success ─────────────────────────────
-        # downtime resets to 0.0 while connected; uptime ticks from the last
-        # online transition recorded in _last_state_change_at.
-        self._store["device_connection_downtime"].data_value = ua.DataValue(
-            Value=ua.Variant(0.0, ua.VariantType.Double),
-            SourceTimestamp=wall_now,
-        )
-        uptime = (now - self._last_state_change_at) if self._last_state_change_at is not None else 0.0
-        self._store["device_connection_uptime"].data_value = ua.DataValue(
-            Value=ua.Variant(uptime, ua.VariantType.Double),
-            SourceTimestamp=wall_now,
-        )
-
-        self._store["device_state"].data_value = ua.DataValue(
-            Value=ua.Variant(1, ua.VariantType.Int32),
-            SourceTimestamp=wall_now,
-        )
-        self._store["device_connected"].data_value = ua.DataValue(
-            Value=ua.Variant(True, ua.VariantType.Boolean),
-            SourceTimestamp=wall_now,
-        )
+        self._process_snmp_results(results, due_oids, force_full)
+        self._update_connection_metrics(True)
         await self.write_variables()
         return True
 
@@ -2058,47 +1838,22 @@ class OPCUAServer:
     _HEARTBEAT_INTERVAL: float = 300.0   # seconds between summary log lines
 
     async def _heartbeat(self) -> None:
-        """
-        Log a one-line summary for every registered poller every
-        _HEARTBEAT_INTERVAL seconds (default: 5 minutes).
-
-        Each line reports:
-          • opcua_path  — the poller's OPC UA path (device identity)
-          • host        — SNMP device IP
-          • online      — current device_connected value
-          • downtime    — seconds since last successful poll (or "never")
-          • uptime      — seconds since device last came online (or "offline")
-        """
-        await asyncio.sleep(self._HEARTBEAT_INTERVAL)
+        """Log a summary for every registered poller every 5 minutes."""
         while True:
+            await asyncio.sleep(self._HEARTBEAT_INTERVAL)
             for poller in self._pollers:
                 store = poller._store
-                online_entry    = store.get("device_connected")
-                downtime_entry  = store.get("device_connection_downtime")
-                uptime_entry    = store.get("device_connection_uptime")
+                online   = store["device_connected"].data_value.Value.Value
+                downtime = store["device_connection_downtime"].data_value.Value.Value
+                uptime   = store["device_connection_uptime"].data_value.Value.Value
 
-                online = (
-                    online_entry.data_value.Value.Value
-                    if online_entry and online_entry.data_value.Value else "?"
-                )
-                downtime_val = (
-                    downtime_entry.data_value.Value.Value
-                    if downtime_entry and downtime_entry.data_value.Value else None
-                )
-                uptime_val = (
-                    uptime_entry.data_value.Value.Value
-                    if uptime_entry and uptime_entry.data_value.Value else None
-                )
-                if online is True:
-                    connection_str = f"uptime={uptime_val:.1f}s" if isinstance(uptime_val, float) else "uptime=?"
+                if online:
+                    conn_str = f"uptime={uptime:.1f}s"
                 else:
-                    connection_str = f"downtime={downtime_val:.1f}s" if isinstance(downtime_val, float) else "downtime=never"
+                    conn_str = f"downtime={downtime:.1f}s" if downtime > 0 else "downtime=never"
 
-                log.info(
-                    "Heartbeat: %s (%s)  online=%s  %s",
-                    poller.opcua_path, poller.host, online, connection_str,
-                )
-            await asyncio.sleep(self._HEARTBEAT_INTERVAL)
+                log.info("Heartbeat: %s (%s) online=%s %s",
+                         poller.opcua_path, poller.host, online, conn_str)
 
     # ── main entry point ──────────────────────────────────────────────────────
 
@@ -2327,82 +2082,42 @@ EXAMPLE_CONFIGS = [
 
 
 def _expand_multi_ip(cfg: dict) -> List[dict]:
-    """
-    If cfg["host"] is a list, expand it into one config dict per address,
-    substituting {instance} (zero-based index) into "opcua_path" and
-    "description" via str.format_map().
-
-    Within each entry in "constants", {instance} is also substituted into
-    the "value" and "description" fields (when they are strings).
-
-    If "opcua_path" does not contain {instance}, a warning is logged and
-    "_{instance}" is appended automatically to avoid duplicate OPC UA paths.
-
-    Returns a list with a single element when "ip" is a plain string.
-    """
-    ip = cfg["host"]
-    if isinstance(ip, str):
+    """Expand multi-IP config into one dict per address."""
+    hosts = cfg["host"]
+    if isinstance(hosts, str):
         return [cfg]
 
-    if not isinstance(ip, list) or not all(isinstance(a, str) for a in ip):
-        sys.exit(
-            f'Config "host" must be a string or a list of strings, '
-            f'got: {ip!r}'
-        )
+    if not isinstance(hosts, list) or not all(isinstance(h, str) for h in hosts):
+        sys.exit(f'Config "host" must be string or list of strings, got: {hosts!r}')
 
-    opcua_path_template = cfg.get("opcua_path", "")
-    if "{instance" not in opcua_path_template:
-        log.warning(
-            'Multi-IP config "opcua_path" (%r) does not contain {instance} --'
-            ' appending "_{instance}" automatically to avoid duplicate paths.',
-            opcua_path_template,
-        )
-        opcua_path_template = opcua_path_template + "_{instance}"
+    path_tpl = cfg.get("opcua_path", "")
+    if "{instance" not in path_tpl:
+        log.warning('Multi-IP path %r missing {instance}, appending automatically', path_tpl)
+        path_tpl += "_{instance}"
 
-    expanded: List[dict] = []
-    for idx, address in enumerate(ip):
+    expanded = []
+    for idx, addr in enumerate(hosts):
         fmt = {"instance": idx}
-        instance_cfg = dict(cfg)
-        instance_cfg["host"] = address
+        inst = dict(cfg, host=addr)
         try:
-            instance_cfg["opcua_path"] = opcua_path_template.format_map(fmt)
-        except (KeyError, ValueError) as exc:
-            sys.exit(f'Bad opcua_path template {opcua_path_template!r}: {exc}')
-        desc = cfg.get("description", "")
-        if desc:
-            try:
-                instance_cfg["description"] = desc.format_map(fmt)
-            except (KeyError, ValueError) as exc:
-                sys.exit(f'Bad description template {desc!r}: {exc}')
+            inst["opcua_path"] = path_tpl.format_map(fmt)
+            if desc := cfg.get("description"):
+                inst["description"] = desc.format_map(fmt)
 
-        # Apply {instance} substitution to each constant's "value" (strings
-        # only) and "description" fields.
-        if cfg.get("constants"):
-            expanded_constants = []
-            for i, c in enumerate(cfg["constants"]):
-                c_out = dict(c)
-                if isinstance(c.get("value"), str):
-                    try:
+            if constants := cfg.get("constants"):
+                inst_consts = []
+                for i, c in enumerate(constants):
+                    c_out = dict(c)
+                    if isinstance(c.get("value"), str):
                         c_out["value"] = c["value"].format_map(fmt)
-                    except (KeyError, ValueError) as exc:
-                        sys.exit(
-                            f'Bad value template {c["value"]!r} in constant '
-                            f'{c.get("opcua_name", i)!r}: {exc}'
-                        )
-                if c.get("description"):
-                    try:
+                    if c.get("description"):
                         c_out["description"] = c["description"].format_map(fmt)
-                    except (KeyError, ValueError) as exc:
-                        sys.exit(
-                            f'Bad description template {c["description"]!r} in constant '
-                            f'{c.get("opcua_name", i)!r}: {exc}'
-                        )
-                expanded_constants.append(c_out)
-            instance_cfg["constants"] = expanded_constants
+                    inst_consts.append(c_out)
+                inst["constants"] = inst_consts
+        except (KeyError, ValueError) as exc:
+            sys.exit(f"Template substitution failed for index {idx}: {exc}")
 
-        expanded.append(instance_cfg)
-        log.debug("Expanded multi-IP config: ip=%s opcua_path=%s",
-                  address, instance_cfg["opcua_path"])
+        expanded.append(inst)
     return expanded
 
 
