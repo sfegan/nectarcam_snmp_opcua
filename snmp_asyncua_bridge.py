@@ -230,14 +230,14 @@ _UA_TYPE_ZEROS: Dict[str, Any] = {
 #   identity       : device_host, device_port
 #   polling metrics: device_polling_interval,
 #                    device_connection_downtime, device_connection_uptime
-#   state flags    : device_connection_established (bridge fact), device_state (overridable)
+#   state flags    : device_connected (bridge fact), device_state (overridable)
 _BUILTIN_VARIABLE_NAMES: frozenset[str] = frozenset({
     "device_host",
     "device_port",
     "device_polling_interval",
     "device_connection_downtime",
     "device_connection_uptime",
-    "device_connection_established",
+    "device_connected",
     "device_state",
 })
 
@@ -592,7 +592,7 @@ class SNMPPoller:
       • device_polling_interval         (Double)  – configured poll interval in seconds
       • device_connection_downtime      (Double)  – seconds since the last successful poll; 0.0 while connected (always Good)
       • device_connection_uptime        (Double)  – seconds since the device last came online; 0.0 while offline (always Good)
-      • device_connection_established   (Boolean) – True when SNMP agent is reachable; never modified by subclasses
+      • device_connected   (Boolean) – True when SNMP agent is reachable; never modified by subclasses
       • device_state                    (Int32)   – 0 = offline, 1 = online (may be overridden by subclasses)
 
     OID variables whose ``opcua_name`` begins with ``"_"`` are *local*: they are
@@ -922,7 +922,7 @@ class SNMPPoller:
             initial_value=0.0,
             description="Seconds since the device last came online; 0.0 while offline (always Good status)",
         )
-        specs["device_connection_established"] = NodeSpec(
+        specs["device_connected"] = NodeSpec(
             opcua_type="Boolean",
             initial_value=False,
             description=(
@@ -1002,7 +1002,7 @@ class SNMPPoller:
           • device_host, device_port, device_polling_interval,
             constants with a real value  →  -1  (never changes; exception-driven)
           • device_connection_downtime, device_connection_uptime,
-            device_connection_established, device_state,
+            device_connected, device_state,
             constants with value=None    →  poll_interval * 1000
           • OID variables                →  poll_interval * poll_every * 1000
 
@@ -1018,7 +1018,7 @@ class SNMPPoller:
         })
         _dynamic_builtins = frozenset({
             "device_connection_downtime", "device_connection_uptime",
-            "device_connection_established", "device_state",
+            "device_connected", "device_state",
         })
         _min_sampling: Dict[str, float] = {}
         for name in _static_builtins:
@@ -1168,9 +1168,9 @@ class SNMPPoller:
                 is_local=False,
             )
 
-        # device_connection_established: bridge-level reachability flag, always Good, never expires.
+        # device_connected: bridge-level reachability flag, always Good, never expires.
         # Set only by _poll_once(); subclasses must not modify this entry.
-        self._store["device_connection_established"] = StoreEntry(
+        self._store["device_connected"] = StoreEntry(
             data_value=ua.DataValue(
                 Value=ua.Variant(False, ua.VariantType.Boolean),
                 SourceTimestamp=datetime.datetime.now(datetime.timezone.utc),
@@ -1574,7 +1574,7 @@ class SNMPPoller:
           requested this cycle and did not respond (online path), or for all
           OIDs (offline path).  OIDs not due this cycle are never touched.
         • Update device_state (1 = online, 0 = offline) and
-          device_connection_established in the store, both with
+          device_connected in the store, both with
           SourceTimestamp=wall_now.
         • Call write_variables() once at the end of every cycle.
 
@@ -1667,7 +1667,7 @@ class SNMPPoller:
                 Value=ua.Variant(0, ua.VariantType.Int32),
                 SourceTimestamp=wall_now,
             )
-            self._store["device_connection_established"].data_value = ua.DataValue(
+            self._store["device_connected"].data_value = ua.DataValue(
                 Value=ua.Variant(False, ua.VariantType.Boolean),
                 SourceTimestamp=wall_now,
             )
@@ -1779,7 +1779,7 @@ class SNMPPoller:
             Value=ua.Variant(1, ua.VariantType.Int32),
             SourceTimestamp=wall_now,
         )
-        self._store["device_connection_established"].data_value = ua.DataValue(
+        self._store["device_connected"].data_value = ua.DataValue(
             Value=ua.Variant(True, ua.VariantType.Boolean),
             SourceTimestamp=wall_now,
         )
@@ -2028,7 +2028,7 @@ class OPCUAServer:
         Each line reports:
           • opcua_path  — the poller's OPC UA path (device identity)
           • host        — SNMP device IP
-          • online      — current device_connection_established value
+          • online      — current device_connected value
           • downtime    — seconds since last successful poll (or "never")
           • uptime      — seconds since device last came online (or "offline")
         """
@@ -2036,7 +2036,7 @@ class OPCUAServer:
         while True:
             for poller in self._pollers:
                 store = poller._store
-                online_entry    = store.get("device_connection_established")
+                online_entry    = store.get("device_connected")
                 downtime_entry  = store.get("device_connection_downtime")
                 uptime_entry    = store.get("device_connection_uptime")
 
