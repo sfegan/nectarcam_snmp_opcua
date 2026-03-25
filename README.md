@@ -276,7 +276,7 @@ The bridge creates the following structure in the OPC UA server:
     - `device_polling_interval` (Double): Configured poll interval in seconds
     - `device_connection_downtime` (Double): Seconds since the last successful poll (0.0 while connected/online). Always has Good status.
     - `device_connection_uptime` (Double): Seconds since the device last came online (0.0 while offline). Always has Good status.
-    - `device_connection_established` (Boolean): True when the SNMP agent is reachable; mirrors the bridge reachability state and is never modified by subclasses
+    - `device_connected` (Boolean): True when the SNMP agent is reachable; mirrors the bridge reachability state and is never modified by subclasses
     - `device_state` (Int32): Bridge connection state (0 = offline, 1 = online)
     - `{opcua_name}`: Configured OID and constant variables
 
