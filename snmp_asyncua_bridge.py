@@ -1037,7 +1037,7 @@ class SNMPPoller:
                 ua.DataValue(ua.Variant(min_sampling, ua.VariantType.Double)),
             )
             self._node_map[opcua_name] = var_node
-            log.debug("%-15s  OPC UA variable: %s.%s (%s)  node_id=%s  min_sampling=%.0fms",
+            log.debug("%s  OPC UA variable: %s.%s (%s)  node_id=%s  min_sampling=%.0fms",
                       self.host, self.opcua_path, opcua_name, spec.opcua_type, var_node.nodeid,
                       min_sampling)
 
@@ -1082,7 +1082,7 @@ class SNMPPoller:
             except Exception as exc:
                 log.error("OPC UA write failed for %s.%s: %s",
                           self.opcua_path, opcua_name, exc)
-        log.debug("%-15s  OPC UA written %d variables: %s", self.host, len(written_list), ", ".join(written_list))
+        log.debug("%s  OPC UA written %d variables: %s", self.host, len(written_list), ", ".join(written_list))
 
     async def on_address_space_ready(self) -> None:
         """
@@ -1232,7 +1232,7 @@ class SNMPPoller:
         object_types = [
             ObjectType(ObjectIdentity(oid_cfg.oid)) for oid_cfg in oid_list
         ]
-        log.debug("%-15s  SNMP GET requesting %d OID(s): %s",
+        log.debug("%s  SNMP GET requesting %d OID(s): %s",
                   self.host, len(oid_list),
                   ", ".join(o.oid for o in oid_list))
         # Re-use the engine and transport target created once; recreating them
@@ -1252,7 +1252,7 @@ class SNMPPoller:
 
         # Transport / auth failure — device completely unreachable
         if error_indication:
-            log.debug("%-15s  SNMP GET error: %s", self.host, error_indication)
+            log.debug("%s  SNMP GET error: %s", self.host, error_indication)
             return None
 
         # Agent-level error — one or more var-binds bad, rest may be ok
@@ -1262,7 +1262,7 @@ class SNMPPoller:
                 str(var_binds[bad_idx][0]) if bad_idx is not None else "unknown"
             )
             log.warning(
-                "%-15s  SNMP GET: agent error '%s' at OID %s – skipping that OID",
+                "%s  SNMP GET: agent error '%s' at OID %s – skipping that OID",
                 self.host, error_status.prettyPrint(), bad_oid,
             )
             # SNMPv2c GET responses carry at most one error_index (RFC 3416
@@ -1281,16 +1281,16 @@ class SNMPPoller:
             # that _resolve_oid_key correctly returns None for these OIDs and
             # they get marked BadNotSupported on the OPC UA side.
             if isinstance(value, (NoSuchObject, NoSuchInstance, EndOfMibView)):
-                log.debug("%-15s  SNMP GET: OID %s returned %s – treating as unsupported",
+                log.debug("%s  SNMP GET: OID %s returned %s – treating as unsupported",
                           self.host, oid_obj, type(value).__name__)
                 continue
             results[str(oid_obj)] = value
 
         if log.isEnabledFor(logging.DEBUG):
-            log.debug("%-15s  SNMP GET: %d var-bind(s) received:",
+            log.debug("%s  SNMP GET: %d var-bind(s) received:",
                       self.host, len(results))
             for oid_key, raw_val in results.items():
-                log.debug("%-15s    %s = %s (%s)",
+                log.debug("%s    %s = %s (%s)",
                           self.host, oid_key, raw_val.prettyPrint(), type(raw_val).__name__)
 
         return results
@@ -1328,14 +1328,14 @@ class SNMPPoller:
         # Batched path: split into chunks and send sequentially.
         n_chunks = (len(oid_list) + effective_limit - 1) // effective_limit
         log.debug(
-            "%-15s  SNMP GET: splitting %d OID(s) into %d chunk(s) of ≤%d (oids_per_get=%d)",
+            "%s  SNMP GET: splitting %d OID(s) into %d chunk(s) of ≤%d (oids_per_get=%d)",
             self.host, len(oid_list), n_chunks, effective_limit, effective_limit,
         )
         merged: Dict[str, Any] = {}
         for chunk_idx in range(n_chunks):
             start = chunk_idx * effective_limit
             chunk = oid_list[start : start + effective_limit]
-            log.debug("%-15s  SNMP GET: sending chunk %d/%d (%d OID(s))",
+            log.debug("%s  SNMP GET: sending chunk %d/%d (%d OID(s))",
                       self.host, chunk_idx + 1, n_chunks, len(chunk))
             partial = await self._get_one_chunk(chunk)
             if partial is None:
@@ -1347,16 +1347,16 @@ class SNMPPoller:
                 # that pattern (responded then stopped) is worth flagging.
                 if chunk_idx > 0:
                     log.warning(
-                        "%-15s  SNMP GET: chunk %d/%d failed after %d successful chunk(s)"
+                        "%s  SNMP GET: chunk %d/%d failed after %d successful chunk(s)"
                         " — discarding partial results and treating cycle as offline",
                         self.host, chunk_idx + 1, n_chunks, chunk_idx,
                     )
                 else:
-                    log.debug("%-15s  SNMP GET: chunk %d/%d failed — aborting batch",
+                    log.debug("%s  SNMP GET: chunk %d/%d failed — aborting batch",
                               self.host, chunk_idx + 1, n_chunks)
                 return None
             merged.update(partial)
-        log.debug("%-15s  SNMP GET: batch complete — %d var-bind(s) total",
+        log.debug("%s  SNMP GET: batch complete — %d var-bind(s) total",
                   self.host, len(merged))
         return merged
 
@@ -1371,7 +1371,7 @@ class SNMPPoller:
         If a poll is still in progress when the next slot fires, that slot
         is skipped entirely.
         """
-        log.info("%-15s  Poller started  path=%s  interval=%.1fs  oids=%d",
+        log.info("%s  Poller started  path=%s  interval=%.1fs  oids=%d",
                  self.host, self.opcua_path, self.poll_interval, len(self.oids))
 
         loop = asyncio.get_running_loop()
@@ -1379,7 +1379,7 @@ class SNMPPoller:
         cycle = 0
 
         while True:
-            log.debug("%-15s  Poller starting slot %d", self.host, cycle + 1)
+            log.debug("%s  Poller starting slot %d", self.host, cycle + 1)
 
             self._polling_cycle = cycle + 1
             async with self._poll_lock:
@@ -1389,7 +1389,7 @@ class SNMPPoller:
             cycle += 1
             now = loop.time()
             while origin + cycle * self.poll_interval <= now:
-                log.debug("%-15s  Poller skipping overrun slot %d", self.host, cycle + 1)
+                log.debug("%s  Poller skipping overrun slot %d", self.host, cycle + 1)
                 cycle += 1
 
             sleep_for = origin + cycle * self.poll_interval - now
@@ -1407,17 +1407,17 @@ class SNMPPoller:
         Returns the matching key, or None if the OID was not in the response.
         """
         if oid_cfg.oid in results:
-            log.debug("%-15s  OID key match (exact): %s", self.host, oid_cfg.oid)
+            log.debug("%s  OID key match (exact): %s", self.host, oid_cfg.oid)
             return oid_cfg.oid
         suffixed = oid_cfg.oid.rstrip(".0") + ".0"
         if suffixed in results:
-            log.debug("%-15s  OID key match (suffixed .0): %s → %s", self.host, oid_cfg.oid, suffixed)
+            log.debug("%s  OID key match (suffixed .0): %s → %s", self.host, oid_cfg.oid, suffixed)
             return suffixed
         for key in results:
             if key.endswith("." + oid_cfg.oid) or oid_cfg.oid.endswith("." + key):
-                log.debug("%-15s  OID key match (suffix boundary): %s → %s", self.host, oid_cfg.oid, key)
+                log.debug("%s  OID key match (suffix boundary): %s → %s", self.host, oid_cfg.oid, key)
                 return key
-        log.debug("%-15s  OID key not found in response: %s  (available keys: %s)",
+        log.debug("%s  OID key not found in response: %s  (available keys: %s)",
                   self.host, oid_cfg.oid, list(results))
         return None
 
@@ -1455,7 +1455,7 @@ class SNMPPoller:
         if entry.lifetime > 0 and elapsed > entry.lifetime:
             if entry.data_value.StatusCode != _bad_no_comm:
                 log.debug(
-                    "%-15s  Lifetime expired for %s.%s (last read %.1fs ago, limit %.1fs)"
+                    "%s  Lifetime expired for %s.%s (last read %.1fs ago, limit %.1fs)"
                     " — marking BadNoCommunication",
                     self.host, self.opcua_path, opcua_name, elapsed, entry.lifetime,
                 )
@@ -1469,7 +1469,7 @@ class SNMPPoller:
                 entry.updated_this_cycle = True
         else:
             if entry.data_value.StatusCode != _uncertain:
-                log.debug("%-15s  Marking %s.%s UncertainLastUsableValue",
+                log.debug("%s  Marking %s.%s UncertainLastUsableValue",
                           self.host, self.opcua_path, opcua_name)
                 entry.data_value = ua.DataValue(
                     Value=entry.data_value.Value,
@@ -1506,7 +1506,7 @@ class SNMPPoller:
     def _handle_offline_state(self) -> None:
         """Process logic for an offline device cycle."""
         if not self._was_offline:
-            log.warning("%-15s  Device went OFFLINE (maximum reconnection delay: %.1fs)", self.host, 
+            log.warning("%s  Device went OFFLINE (maximum reconnection delay: %.1fs)", self.host, 
                         max(self.backoff_interval, self.poll_interval))
             self._oid_key_cache.clear()
             self._was_offline = True
@@ -1516,7 +1516,7 @@ class SNMPPoller:
             max_delay = max(1, int(self.backoff_interval / self.poll_interval))
             self._reconnection_delay = min(max_delay, self._reconnection_delay * 2)
 
-        log.debug("%-15s  Device OFFLINE (backoff: %d cycles)", self.host, self._reconnection_delay)
+        log.debug("%s  Device OFFLINE (backoff: %d cycles)", self.host, self._reconnection_delay)
 
         # Skip future cycles for all OIDs
         for oid_cfg in self.oids:
@@ -1528,7 +1528,7 @@ class SNMPPoller:
 
     def _handle_online_transition(self, results: Dict[str, Any]) -> None:
         """Resolve OID keys when device first responds after being offline."""
-        log.warning("%-15s  Device came ONLINE, polling every %.1fs", self.host, self.poll_interval)
+        log.warning("%s  Device came ONLINE, polling every %.1fs", self.host, self.poll_interval)
         self._oid_key_cache.clear()
         self._was_offline = False
         self._last_state_change_at = time.monotonic()
@@ -1539,14 +1539,14 @@ class SNMPPoller:
             if key:
                 self._oid_key_cache[cfg.opcua_name] = key
             else:
-                log.warning("%-15s  OID not supported: %s", self.host, cfg.oid)
+                log.warning("%s  OID not supported: %s", self.host, cfg.oid)
                 entry = self._store[cfg.opcua_name]
                 entry.data_value = ua.DataValue(
                     Value=ua.Variant(_UA_TYPE_ZEROS.get(entry.opcua_type, ""),
                                      _UA_TYPE_MAP[entry.opcua_type][0]),
                     StatusCode_=ua.StatusCode(ua.StatusCodes.BadNotSupported),
                 )
-        log.debug("%-15s  Resolved %d OID keys", self.host, len(self._oid_key_cache))
+        log.debug("%s  Resolved %d OID keys", self.host, len(self._oid_key_cache))
 
     def _process_snmp_results(self, results: Dict[str, Any], due_oids: List[OIDConfig], force_full: bool) -> None:
         """Store OID values and handle staleness for non-responding due OIDs."""
@@ -1598,7 +1598,7 @@ class SNMPPoller:
             return True
 
         if self._was_offline:
-            log.info("%-15s  Attempting to connect; polling %d OID(s); reconnection delay %.1fs", 
+            log.info("%s  Attempting to connect; polling %d OID(s); reconnection delay %.1fs", 
                      self.host, len(due_oids), self._reconnection_delay*self.poll_interval)
 
         results = await self._get_all_oids(due_oids, self.oids_per_get)
@@ -1652,7 +1652,7 @@ class SNMPPoller:
                     raise ua.UaError("Device did not respond after applying setting")
         """
         async with self._poll_lock:
-            log.debug("%-15s  Force_reload: issuing full GET", self.host)
+            log.debug("%s  Force_reload: issuing full GET", self.host)
             return await self._poll_once(force_full=True)
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -1762,7 +1762,7 @@ class OPCUAServer:
             "unlimited" if poller.oids_per_get == 0
             else f"{poller.oids_per_get} OID(s)/GET"
         )
-        log.info("%-15s  Registered poller: %s  (oids_per_get: %s)",
+        log.info("%s  Registered poller: %s  (oids_per_get: %s)",
                  poller.host, poller.opcua_path, limit_desc)
 
     # ── address space construction ────────────────────────────────────────────
@@ -1841,7 +1841,7 @@ class OPCUAServer:
             await poller.create_variables(device_node, ns_idx, specs)
             await poller.on_address_space_ready()
 
-            log.info("%-15s  Address space built for %s (%d variable(s))",
+            log.info("%s  Address space built for %s (%d variable(s))",
                      poller.host, poller.opcua_path, len(poller._node_map))
 
     # ── heartbeat ─────────────────────────────────────────────────────────────
@@ -1860,10 +1860,10 @@ class OPCUAServer:
                 path     = '.'.join(self.root_parts + [poller.opcua_path])
 
                 if online:
-                    log.info("%-15s  Heartbeat: %d OIDs in %s  *ONLINE*  uptime=%.1fs",
+                    log.info("%s  Heartbeat: %d OIDs in %s  *ONLINE*  uptime=%.1fs",
                              poller.host, len(poller._node_map), path, uptime)
                 else:
-                    log.info("%-15s  Heartbeat: %d OIDs in %s  *OFFLINE*  downtime=%.1fs  reconnection_delay=%.1fs",
+                    log.info("%s  Heartbeat: %d OIDs in %s  *OFFLINE*  downtime=%.1fs  reconnection_delay=%.1fs",
                              poller.host, len(poller._node_map), path, downtime, 
                              poller._reconnection_delay*poller.poll_interval)
 
