@@ -1646,12 +1646,13 @@ class OPCUAServer:
                 path     = '.'.join(self.root_parts + [poller.opcua_path])
 
                 num_vars = sum(1 for e in store.values() if e.node is not None)
+                num_oid = len(poller.oids)
                 if online:
-                    log.info("%s  Heartbeat: %d OIDs in %s  *ONLINE*  uptime=%.1fs",
-                             poller.host, num_vars, path, uptime)
+                    log.info("%s  Heartbeat: %d nodes, %d OIDs in %s  *ONLINE*  uptime=%.1fs",
+                             poller.host, num_vars, num_oid, path, uptime)
                 else:
-                    log.info("%s  Heartbeat: %d OIDs in %s  *OFFLINE*  downtime=%.1fs  reconnection_delay=%.1fs",
-                             poller.host, num_vars, path, downtime, 
+                    log.info("%s  Heartbeat: %d nodes, %d OIDs in %s  *OFFLINE*  downtime=%.1fs  reconnection_delay=%.1fs",
+                             poller.host, num_vars, num_oid, path, downtime, 
                              poller._reconnection_delay*poller.poll_interval)
 
     # ── main entry point ──────────────────────────────────────────────────────
