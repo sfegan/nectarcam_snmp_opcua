@@ -508,7 +508,7 @@ class StoreEntry:
                     only — forced full-reloads never advance next_cycle).
                     Reset to _polling_cycle when the device goes offline so all
                     variables are re-read on the next successful cycle.
-    updated_this_cycle
+    updated_since_write
                     True when this entry received a fresh value from SNMP in the
                     current _poll_once() cycle.  Cleared at the start of every
                     cycle (before the GET) and set when the SNMP response is
@@ -523,7 +523,7 @@ class StoreEntry:
     opcua_type:       str
     is_local:         bool = False
     next_cycle:       int  = 0        # PLL cycle on which this variable is next due
-    updated_this_cycle: bool = False  # set by _poll_once when a fresh SNMP value is
+    updated_since_write: bool = False  # set by _poll_once when a fresh SNMP value is
                                       # stored; cleared at the start of each cycle
 
 
@@ -569,7 +569,7 @@ class SNMPPoller:
       • ``lifetime``            – expiry window in seconds (0 = never)
       • ``opcua_type``          – OPC UA type name string
       • ``is_local``            – True for underscore-prefixed OID variables
-      • ``updated_this_cycle``  – True when a fresh SNMP value was stored this
+      • ``updated_since_write``  – True when a fresh SNMP value was stored this
                                   cycle; always False for constants and built-ins.
                                   Subclasses may gate derived-value computation on
                                   this flag in ``write_variables()``.
@@ -1041,7 +1041,7 @@ class SNMPPoller:
                       self.host, self.opcua_path, opcua_name, spec.opcua_type, var_node.nodeid,
                       min_sampling)
 
-    async def write_variables(self) -> None:
+    async def write_variables(self, write_all_values: bool = False) -> None:
         """
         Write every non-local store entry to its OPC UA node.
 
@@ -1069,7 +1069,7 @@ class SNMPPoller:
         """
         written_list = []
         for opcua_name, entry in self._store.items():
-            if entry.is_local or not entry.updated_this_cycle:
+            if entry.is_local or not (entry.updated_since_write or write_all_values):
                 continue
             node = self._node_map.get(opcua_name)
             if node is None:
@@ -1079,6 +1079,7 @@ class SNMPPoller:
                 #           self.opcua_path, opcua_name, entry.data_value)
                 await node.write_value(entry.data_value)
                 written_list.append(opcua_name)
+                entry.updated_since_write = False
             except Exception as exc:
                 log.error("OPC UA write failed for %s.%s: %s",
                           self.opcua_path, opcua_name, exc)
@@ -1466,7 +1467,7 @@ class SNMPPoller:
                     ),
                     StatusCode_=_bad_no_comm,
                 )
-                entry.updated_this_cycle = True
+                entry.updated_since_write = True
         else:
             if entry.data_value.StatusCode != _uncertain:
                 log.debug("%s  Marking %s.%s UncertainLastUsableValue",
@@ -1475,7 +1476,7 @@ class SNMPPoller:
                     Value=entry.data_value.Value,
                     StatusCode_=_uncertain,
                 )
-                entry.updated_this_cycle = True
+                entry.updated_since_write = True
 
     def _update_connection_metrics(self, is_online: bool) -> None:
         """Update built-in connection metrics in the store."""
@@ -1501,7 +1502,7 @@ class SNMPPoller:
                 SourceTimestamp=wall_now,
             )
             entry.timestamp = now
-            entry.updated_this_cycle = True
+            entry.updated_since_write = True
 
     def _handle_offline_state(self) -> None:
         """Process logic for an offline device cycle."""
@@ -1569,7 +1570,7 @@ class SNMPPoller:
                 entry.data_value = variant  # cast failed (DataValue with Bad status)
 
             entry.timestamp = now
-            entry.updated_this_cycle = True
+            entry.updated_since_write = True
             responded.add(cfg.opcua_name)
 
             if not force_full:
@@ -1584,10 +1585,6 @@ class SNMPPoller:
         """
         Single polling cycle: fetch OIDs, update store, and write to OPC UA.
         """
-        for cfg in self.oids:
-            if entry := self._store.get(cfg.opcua_name):
-                entry.updated_this_cycle = False
-
         due_oids = self.oids if force_full else [
             o for o in self.oids if self._store[o.opcua_name].next_cycle <= self._polling_cycle
         ]
@@ -1840,6 +1837,7 @@ class OPCUAServer:
             specs = poller.build_variable_specs()
             await poller.create_variables(device_node, ns_idx, specs)
             await poller.on_address_space_ready()
+            await poller.write_variables(True)
 
             log.info("%s  Address space built for %s (%d variable(s))",
                      poller.host, poller.opcua_path, len(poller._node_map))
