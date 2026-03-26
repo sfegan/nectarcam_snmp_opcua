@@ -1067,18 +1067,20 @@ class SNMPPoller:
                         )
                 await super().write_variables()
         """
+        written_list = []
         for opcua_name, entry in self._store.items():
-            if entry.is_local:
+            if entry.is_local or not entry.updated_this_cycle:
                 continue
             node = self._node_map.get(opcua_name)
             if node is None:
                 continue
-            log.debug("  Writing %s.%s = %s", self.opcua_path, opcua_name, entry.data_value)
             try:
                 await node.write_value(entry.data_value)
+                written_list.append(opcua_name)
             except Exception as exc:
                 log.error("OPC UA write failed for %s.%s: %s",
                           self.opcua_path, opcua_name, exc)
+        log.debug("OPCUA written %d variables: %s", len(written_list), ", ".join(written_list))
 
     async def on_address_space_ready(self) -> None:
         """
@@ -1458,21 +1460,23 @@ class SNMPPoller:
                     " — marking BadNoCommunication",
                     self.opcua_path, opcua_name, elapsed, entry.lifetime,
                 )
-            entry.data_value = ua.DataValue(
-                Value=ua.Variant(
-                    _UA_TYPE_ZEROS.get(entry.opcua_type, ""),
-                    _UA_TYPE_MAP[entry.opcua_type][0],
-                ),
-                StatusCode_=_bad_no_comm,
-            )
+                entry.data_value = ua.DataValue(
+                    Value=ua.Variant(
+                        _UA_TYPE_ZEROS.get(entry.opcua_type, ""),
+                        _UA_TYPE_MAP[entry.opcua_type][0],
+                    ),
+                    StatusCode_=_bad_no_comm,
+                )
+                entry.updated_this_cycle = True
         else:
             if entry.data_value.StatusCode != _uncertain:
                 log.debug("Marking %s.%s UncertainLastUsableValue",
                           self.opcua_path, opcua_name)
-            entry.data_value = ua.DataValue(
-                Value=entry.data_value.Value,
-                StatusCode_=_uncertain,
-            )
+                entry.data_value = ua.DataValue(
+                    Value=entry.data_value.Value,
+                    StatusCode_=_uncertain,
+                )
+                entry.updated_this_cycle = True
 
     def _update_connection_metrics(self, is_online: bool) -> None:
         """Update built-in connection metrics in the store."""
@@ -1492,10 +1496,13 @@ class SNMPPoller:
             ("device_state",               1 if is_online else 0),
             ("device_connected",           is_online),
         ]:
-            self._store[name].data_value = ua.DataValue(
+            entry = self._store.get(name)
+            entry.data_value = ua.DataValue(
                 Value=ua.Variant(val, self._store[name].data_value.Value.VariantType),
                 SourceTimestamp=wall_now,
             )
+            entry.timestamp = now
+            entry.updated_this_cycle = True
 
     def _handle_offline_state(self) -> None:
         """Process logic for an offline device cycle."""
@@ -1521,7 +1528,7 @@ class SNMPPoller:
 
     def _handle_online_transition(self, results: Dict[str, Any]) -> None:
         """Resolve OID keys when device first responds after being offline."""
-        log.warning("Device came online: %s — resolving OID keys", self.host)
+        log.warning("Device came online: %s", self.host)
         self._oid_key_cache.clear()
         self._was_offline = False
         self._last_state_change_at = time.monotonic()
@@ -1539,6 +1546,7 @@ class SNMPPoller:
                                      _UA_TYPE_MAP[entry.opcua_type][0]),
                     StatusCode_=ua.StatusCode(ua.StatusCodes.BadNotSupported),
                 )
+        log.debug("Resolved %d OID keys", len(self._oid_key_cache))
 
     def _process_snmp_results(self, results: Dict[str, Any], due_oids: List[OIDConfig], force_full: bool) -> None:
         """Store OID values and handle staleness for non-responding due OIDs."""
