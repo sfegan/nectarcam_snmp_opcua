@@ -331,8 +331,15 @@ def _resolve_via_pysnmp(oid: str) -> Optional[str]:
         obj = ObjectIdentity(oid)
         obj.resolveWithMib(mib_view)
         return str(obj.getOid())
-    except Exception as exc:
+    except ImportError:
+        log.debug("pysnmp MIB compiler not available for %r", oid)
+        return None
+    except (ValueError, KeyError, AttributeError) as exc:
         log.debug("pysnmp MIB resolution failed for %r: %s", oid, exc)
+        return None
+    except Exception as exc:
+        log.warning("Unexpected error during pysnmp MIB resolution for %r: %s: %s",
+                    oid, type(exc).__name__, exc)
         return None
 
 
@@ -647,6 +654,11 @@ class SNMPPoller:
     # on_address_space_ready() onwards.
     _device_node: Any = field(default=None, init=False, repr=False)
     _snmp_engine: Any = field(default=None, init=False, repr=False)
+    # Dot-joined absolute OPC UA node path string, e.g. "SNMPDevices.Switch01".
+    # Set by OPCUAServer._build_address_space() before create_variables() is
+    # called.  Used by create_variables() to build stable string NodeIds of the
+    # form ns=2;s="SNMPDevices.Switch01.some_var".
+    _opcua_node_path: str = field(default="", init=False, repr=False)
     # UdpTransportTarget is async to construct, so it is created lazily on the
     # first poll and cached here.  ip/port/timeout/retries never change so one
     # instance suffices for the lifetime of the poller.
@@ -696,10 +708,9 @@ class SNMPPoller:
                 f"for poller {self.opcua_path!r}"
             )
 
-        # Create the SnmpEngine once and reuse it across all polls.
-        # Recreating it on every call is heavyweight (dispatcher threads, etc.)
-        # and leaks resources even when close_dispatcher() is called.
-        self._snmp_engine = SnmpEngine()
+        # SnmpEngine is created lazily on the first poll (_get_one_chunk) so
+        # that it is only allocated when the poller actually runs, and can be
+        # properly closed on teardown.  See also close() / _snmp_engine field.
 
         # Names reserved for built-in server variables — cannot be used as OID
         # or constant names because they would silently overwrite each other's
@@ -914,8 +925,9 @@ class SNMPPoller:
         Local variables (is_local=True) are skipped.
         """
         _poll_ms = self.poll_interval * 1000.0
-        # _opcua_node_path is set by OPCUAServer._build_address_space
-        base_path = getattr(self, "_opcua_node_path", None) or self.opcua_path
+        # _opcua_node_path is set by OPCUAServer._build_address_space before
+        # this method is called; fall back to opcua_path for standalone use.
+        base_path = self._opcua_node_path or self.opcua_path
 
         # Built-in OIDs and constants sampling intervals
         _static_builtins = {"device_host", "device_port", "device_polling_interval"}
@@ -1025,6 +1037,9 @@ class SNMPPoller:
                   ", ".join(o.oid for o in oid_list))
         # Re-use the engine and transport target created once; recreating them
         # on every call is heavyweight and leaks resources.
+        if self._snmp_engine is None:
+            self._snmp_engine = SnmpEngine()
+            log.debug("%s  SnmpEngine created (lazy init)", self.host)
         if self._transport_target is None:
             self._transport_target = await UdpTransportTarget.create(
                 (self.host, self.port), timeout=self.snmp_timeout, retries=self.snmp_retries
@@ -1270,7 +1285,7 @@ class SNMPPoller:
         now = time.monotonic()
         wall_now = datetime.datetime.now(datetime.timezone.utc)
 
-        if not self._last_state_change_at:
+        if self._last_state_change_at is None:
             self._last_state_change_at = now
 
         elapsed = round(now - self._last_state_change_at, 1)
@@ -1283,7 +1298,7 @@ class SNMPPoller:
             ("device_state",               1 if is_online else 0),
             ("device_connected",           is_online),
         ]:
-            entry = self._store.get(name)
+            entry = self._store[name]
             entry.data_value = ua.DataValue(
                 Value=ua.Variant(val, self._store[name].data_value.Value.VariantType),
                 SourceTimestamp=wall_now,
@@ -1438,6 +1453,26 @@ class SNMPPoller:
         async with self._poll_lock:
             log.debug("%s  Force_reload: issuing full GET", self.host)
             return await self._poll_once(force_full=True)
+
+    def close(self) -> None:
+        """
+        Release resources held by this poller.
+
+        Closes the SnmpEngine (which owns dispatcher threads and sockets) if it
+        was created, and clears the cached transport target.  Called automatically
+        by OPCUAServer.run() on shutdown; subclasses that construct pollers
+        outside of OPCUAServer should call this explicitly when done.
+
+        Safe to call multiple times.
+        """
+        if self._snmp_engine is not None:
+            try:
+                self._snmp_engine.closeDispatcher()
+            except Exception as exc:
+                log.debug("%s  SnmpEngine.closeDispatcher() raised: %s", self.host, exc)
+            self._snmp_engine = None
+            self._transport_target = None
+            log.debug("%s  SnmpEngine closed", self.host)
 
 # ─────────────────────────────────────────────────────────────────────────────
 # Simple username/password validator for asyncua
@@ -1604,7 +1639,7 @@ class OPCUAServer:
                 server, ns_idx, all_parts
             )
             poller._device_node = device_node
-            # Store the absolute dot-joined path so create_variables can build
+            # Set the declared dataclass field so create_variables can build
             # string NodeIds of the form  ns=2;s="SNMPDevices.Switch01.some_var"
             poller._opcua_node_path = node_path_str
 
@@ -1718,6 +1753,10 @@ class OPCUAServer:
                 for t in tasks:
                     t.cancel()
                 await asyncio.gather(*tasks, return_exceptions=True)
+            finally:
+                for poller in self._pollers:
+                    poller.close()
+                log.debug("All poller SNMP engines closed")
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -1804,7 +1843,9 @@ def parse_args() -> argparse.Namespace:
         action="store_true",
         default=False,
         help=(
-            "Strip leading underscores from local (underscore-prefixed) OID names "            "so they are published as OPC UA variables instead of being kept "            "server-side only.  Intended for testing and diagnostics."
+            "Strip leading underscores from local (underscore-prefixed) OID names "
+            "so they are published as OPC UA variables instead of being kept "
+            "server-side only.  Intended for testing and diagnostics."
         ),
     )
     p.add_argument(
