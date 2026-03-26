@@ -492,6 +492,7 @@ class NodeStore:
     is_local:         bool = False
     next_cycle:       int = 0
     updated_since_write: bool = False
+    node:             Optional[Any] = None
 
 
 
@@ -628,7 +629,6 @@ class SNMPPoller:
     oids_per_get: int = -1
 
     # ── runtime state (set by OPCUAServer during registration) ───────────────
-    _node_map: Dict[str, Any] = field(default_factory=dict, init=False, repr=False)
     # Internal data store: opcua_name → NodeStore for ALL variables managed by
     # this poller (OIDs, constants, server variables).  Populated in
     # build_variable_specs() which is called during server registration.
@@ -703,7 +703,7 @@ class SNMPPoller:
 
         # Names reserved for built-in server variables — cannot be used as OID
         # or constant names because they would silently overwrite each other's
-        # OPC UA node in _node_map and their store entries.
+        # store entries.
         # Detect duplicate opcua_name values within this poller's OID list and
         # constants, and guard against collisions with the built-in variable names.
         seen: set[str] = set()
@@ -909,8 +909,7 @@ class SNMPPoller:
         store: Dict[str, "NodeStore"],
     ) -> None:
         """
-        Create OPC UA variable nodes from *store* under *device_node* and
-        register them in self._node_map.
+        Create OPC UA variable nodes from *store* under *device_node*.
 
         Local variables (is_local=True) are skipped.
         """
@@ -962,7 +961,7 @@ class SNMPPoller:
                 ua.AttributeIds.MinimumSamplingInterval,
                 ua.DataValue(ua.Variant(min_sampling, ua.VariantType.Double)),
             )
-            self._node_map[opcua_name] = var_node
+            entry.node = var_node
             log.debug("%s  OPC UA variable: %s.%s (%s)  node_id=%s  min_sampling=%.0fms",
                       self.host, self.opcua_path, opcua_name, entry.opcua_type, var_node.nodeid,
                       min_sampling)
@@ -971,39 +970,17 @@ class SNMPPoller:
         """
         Write every non-local store entry to its OPC UA node.
 
-        Iterates ``self._store`` and writes every entry that has a node in
-        ``_node_map``.  Local OID entries (``is_local=True``) and entries with
-        no corresponding node are silently skipped.
-
-        Override to intercept or modify store entries before writing.  Your
-        override can inspect and mutate ``self._store`` (e.g. to compute a
-        derived variable and add/update an entry), then call
-        ``await super().write_variables()`` to perform the actual writes.
-
-        Example — derive a computed variable from a local raw OID::
-
-            async def write_variables(self):
-                raw_entry = self._store.get("_rawPower")
-                if raw_entry and raw_entry.data_value.Value is not None:
-                    watts = raw_entry.data_value.Value.Value * 1000
-                    entry = self._store.get("PowerMilliWatts")
-                    if entry:
-                        entry.data_value = ua.DataValue(
-                            ua.Variant(float(watts), ua.VariantType.Double)
-                        )
-                await super().write_variables()
+        Iterates ``self._store`` and writes every entry that has a node.
+        Local OID entries (``is_local=True``) are silently skipped.
         """
         written_list = []
         for opcua_name, entry in self._store.items():
             if entry.is_local or not (entry.updated_since_write or write_all_values):
                 continue
-            node = self._node_map.get(opcua_name)
-            if node is None:
+            if entry.node is None:
                 continue
             try:
-                # log.debug("Writing OPC UA variable %s.%s: %s",
-                #           self.opcua_path, opcua_name, entry.data_value)
-                await node.write_value(entry.data_value)
+                await entry.node.write_value(entry.data_value)
                 written_list.append(opcua_name)
                 entry.updated_since_write = False
             except Exception as exc:
@@ -1015,7 +992,7 @@ class SNMPPoller:
         """
         Called once after all OPC UA nodes have been created for this poller.
 
-        self._device_node and self._node_map are fully populated at this point.
+        self._device_node and the store entries are fully populated at this point.
         Override to perform any one-time setup that requires access to the
         node tree.
         """
@@ -1649,8 +1626,9 @@ class OPCUAServer:
             await poller.on_address_space_ready()
             await poller.write_variables(True)
 
+            num_vars = sum(1 for e in poller._store.values() if e.node is not None)
             log.info("%s  Address space built for %s (%d variable(s))",
-                     poller.host, poller.opcua_path, len(poller._node_map))
+                     poller.host, poller.opcua_path, num_vars)
 
     # ── heartbeat ─────────────────────────────────────────────────────────────
 
@@ -1667,12 +1645,13 @@ class OPCUAServer:
                 uptime   = store["device_connection_uptime"].data_value.Value.Value
                 path     = '.'.join(self.root_parts + [poller.opcua_path])
 
+                num_vars = sum(1 for e in store.values() if e.node is not None)
                 if online:
                     log.info("%s  Heartbeat: %d OIDs in %s  *ONLINE*  uptime=%.1fs",
-                             poller.host, len(poller._node_map), path, uptime)
+                             poller.host, num_vars, path, uptime)
                 else:
                     log.info("%s  Heartbeat: %d OIDs in %s  *OFFLINE*  downtime=%.1fs  reconnection_delay=%.1fs",
-                             poller.host, len(poller._node_map), path, downtime, 
+                             poller.host, num_vars, path, downtime, 
                              poller._reconnection_delay*poller.poll_interval)
 
     # ── main entry point ──────────────────────────────────────────────────────
