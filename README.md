@@ -301,16 +301,17 @@ The bridge uses appropriate OPC UA status codes:
 
 `SNMPPoller` is designed to be subclassed for devices that require derived variables or custom OPC UA method handlers. The key hooks are `build_variable_specs()`, `create_variables()`, `write_variables()`, and `on_address_space_ready()`.
 
-### The `updated_this_cycle` flag
+### The `updated_since_write` flag
 
-Each OID store entry (`self._store[opcua_name]`) carries an `updated_this_cycle` boolean that is `True` only when the SNMP poll in the current cycle successfully stored a fresh value for that OID. It is cleared at the start of every cycle before the GET, and is never set for constants or built-in variables.
+Each OID store entry (`self._store[opcua_name]`) carries an `updated_since_write` boolean that is `True` only when the SNMP poll in the current cycle successfully stored a fresh value for that OID. Only variables with this flag set are written to the OPC UA layer each
+iteration. The flag is cleared after the variable has been written.
 
-This flag is particularly important in `write_variables()` overrides that compute derived values from raw OID data. Without it, a derived conversion applied to a value that was already converted in a previous cycle (because `poll_every > 1` means the OID was not re-read this cycle) will fail or produce a wrong result. The correct pattern is:
+This flag is particularly important if `write_variables()` is overriddrn to compute derived values from raw OID data. Without it, a derived conversion applied to a value that was already converted in a previous cycle (because `poll_every > 1` means the OID was not re-read this cycle) will fail or produce a wrong result. The correct pattern is:
 
 ```python
 async def write_variables(self):
     entry = self._store["_rawTemperature"]
-    if entry.updated_this_cycle:
+    if entry.updated_since_write:
         # raw bytes fresh from SNMP — safe to convert
         raw = entry.data_value.Value.Value
         self._store["temperature"].data_value = ua.DataValue(
@@ -319,7 +320,7 @@ async def write_variables(self):
     await super().write_variables()
 ```
 
-If `updated_this_cycle` is `False`, the source OID was not polled this cycle and the derived variable's existing store value (from the last cycle it was updated) should be left unchanged.
+If `updated_since_write` is `False`, the source OID was not polled this cycle and the derived variable's existing store value (from the last cycle it was updated) should be left unchanged.
 
 ## Logging
 
