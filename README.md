@@ -111,7 +111,8 @@ Each OID in the `oids` array is a JSON object with:
 
 - `oid` (string): OID identifier, either in dotted-decimal notation (e.g., `"1.3.6.1.2.1.1.1.0"`) or symbolic name (e.g., `"SNMPv2-MIB::sysDescr.0"`). Symbolic names are automatically resolved to numeric form at startup.
 - `opcua_name` (string): Name of the OPC UA variable. Names beginning with `_` are *local*: polled and stored internally but not published as OPC UA nodes (useful as inputs for derived variables in subclasses).
-- `opcua_type` (string): OPC UA data type. Supported types: `Boolean`, `SByte`, `Byte`, `Int16`, `UInt16`, `Int32`, `UInt32`, `Int64`, `UInt64`, `Float`, `Double`, `String`, `ByteString`, `DateTime`
+- `opcua_type` (string): OPC UA data type. Supported types: `Boolean`, `SByte`, `Byte`, `Int16`, `UInt16`, `Int32`, `UInt32`, `Int64`, `UInt64`, `Float`, `Double`, `String`, `ByteString`, `DateTime`, `Enum`
+- `enum` (object, optional): Mapping for `Enum` type, as an integer-to-string dictionary. When `opcua_type` is `Enum`, the SNMP value is read as an integer, mapped via this table, and published to OPC UA as a `String`. If the integer value is not found in the map, a string like `"Unknown(X)"` is published. Example: `"enum": {"0": "Off", "1": "On"}`.
 - `description` (string, optional): Description of the OID (default: `""`)
 - `lifetime` (number, optional): Lifetime in seconds for this variable. Any negative value means use the device-level `default_lifetime`. `0` means never expire. When the device is unreachable and the lifetime has elapsed the variable transitions from `UncertainLastUsableValue` to `BadNoCommunication`.
 - `poll_every` (integer, optional): Read this OID only every N poll cycles (default: 1, meaning every cycle). Values less than 1 are silently treated as 1. Use this to reduce SNMP traffic for slowly-changing values such as device names, firmware versions, or link status while keeping faster-changing values (counters, temperatures) at the full poll rate. See [Per-OID Poll Frequency](#per-oid-poll-frequency) below.
@@ -121,7 +122,7 @@ Each OID in the `oids` array is a JSON object with:
 Each constant in the `constants` array is a JSON object with:
 
 - `opcua_name` (string): Name of the OPC UA variable
-- `opcua_type` (string): OPC UA data type. Supported types: `Boolean`, `SByte`, `Byte`, `Int16`, `UInt16`, `Int32`, `UInt32`, `Int64`, `UInt64`, `Float`, `Double`, `String`, `ByteString`, `DateTime`
+- `opcua_type` (string): OPC UA data type. Supported types: `Boolean`, `SByte`, `Byte`, `Int16`, `UInt16`, `Int32`, `UInt32`, `Int64`, `UInt64`, `Float`, `Double`, `String`, `ByteString`, `DateTime`, `Enum`
 - `value` (any): The constant value to write (must be compatible with `opcua_type`). Use `null` to create a placeholder node that starts as `BadWaitingForInitialData` and is intended to be filled in by a subclass.
 - `description` (string, optional): Description of the constant
 - `lifetime` (number, optional): Lifetime in seconds. Any negative value means use the device-level `default_lifetime` (for `null`-value derived constants) or `0` (for true constants). `0` means never expire.

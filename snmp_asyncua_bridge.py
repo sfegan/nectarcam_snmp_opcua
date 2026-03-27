@@ -27,6 +27,12 @@ Each device is defined by an object like:
                 "opcua_name": "sysDescr",
                 "opcua_type": "String",
                 "poll_every": 5         # read every 5 cycles (default 1)
+            },
+            {
+                "oid":        "1.3.6.1.2.1.1.7.0",
+                "opcua_name": "sysServices",
+                "opcua_type": "Enum",
+                "enum":       {"0": "None", "72": "App+Internet"}
             }
         ],
         "constants": [                  # optional; written once at startup
@@ -42,7 +48,7 @@ Multi-IP expansion: when "host" is an array, one poller is created per address.
 {instance} in "opcua_path" and "description" is replaced with the index.
 
 Supported OPC UA types: Boolean, SByte, Byte, Int16, UInt16, Int32, UInt32,
-Int64, UInt64, Float, Double, String, ByteString, DateTime.
+Int64, UInt64, Float, Double, String, ByteString, DateTime, Enum.
 """
 
 from __future__ import annotations
@@ -62,15 +68,27 @@ from typing import Any, Dict, List, Optional
 # ── third-party ──────────────────────────────────────────────────────────────
 try:
     # pysnmp 7.x (lextudio fork) uses v3arch.asyncio
-    from pysnmp.hlapi.v3arch.asyncio import (
-        CommunityData,
-        ContextData,
-        ObjectIdentity,
-        ObjectType,
-        SnmpEngine,
-        UdpTransportTarget,
-        get_cmd,                        # 7.x uses snake_case names
-    )
+    try:
+        from pysnmp.hlapi.v3arch.asyncio import (
+            CommunityData,
+            ContextData,
+            ObjectIdentity,
+            ObjectType,
+            SnmpEngine,
+            UdpTransportTarget,
+            get_cmd,
+        )
+    except ImportError:
+        # Fallback for pysnmp 6.x or earlier lextudio fork
+        from pysnmp.hlapi.asyncio import (
+            CommunityData,
+            ContextData,
+            ObjectIdentity,
+            ObjectType,
+            SnmpEngine,
+            UdpTransportTarget,
+            getCmd as get_cmd,
+        )
     from pysnmp.proto.rfc1902 import (
         Counter32,
         Counter64,
@@ -83,8 +101,8 @@ try:
         Unsigned32,
     )
     from pysnmp.proto.rfc1905 import EndOfMibView, NoSuchInstance, NoSuchObject
-except ImportError:
-    sys.exit("pysnmp is required:  pip install pysnmp-lextudio")
+except ImportError as exc:
+    sys.exit(f"pysnmp is required: {exc} - pip install pysnmp-lextudio")
 
 try:
     from asyncua import Server, ua
@@ -145,6 +163,7 @@ _UA_TYPE_MAP: Dict[str, tuple[ua.VariantType, Any]] = {
     "String":     (ua.VariantType.String,     str),
     "ByteString": (ua.VariantType.ByteString, bytes),
     "DateTime":   (ua.VariantType.DateTime,   None),  # cast_fn unused; values are datetime objects
+    "Enum":       (ua.VariantType.String,     str),   # published as String, read as int
 }
 
 # Typed zero values for each OPC UA type -- used when a constant is declared
@@ -165,6 +184,7 @@ _UA_TYPE_ZEROS: Dict[str, Any] = {
     "String":     "",
     "ByteString": b"",
     "DateTime":   datetime.datetime.fromtimestamp(0, tz=datetime.timezone.utc),
+    "Enum":       "",
 }
 
 
@@ -235,7 +255,7 @@ def _snmp_value_to_python(raw_value: Any) -> Any:
     return raw_value.prettyPrint()
 
 
-def _cast_to_ua(value: Any, opcua_type: str) -> ua.DataValue | ua.Variant:
+def _cast_to_ua(value: Any, opcua_type: str, enum_map: Optional[Dict[int, str]] = None) -> ua.DataValue | ua.Variant:
     """
     Cast a Python value to the requested OPC UA Variant.
 
@@ -257,9 +277,22 @@ def _cast_to_ua(value: Any, opcua_type: str) -> ua.DataValue | ua.Variant:
     datetime.timedelta values (from TimeTicks OIDs) are converted to
     milliseconds (as a float) for any numeric UA type, or to their str()
     representation (e.g. "5:23:49.160000") for String.
+
+    When opcua_type is "Enum", the value is assumed to be an integer (or a
+    string/bytes convertible to one) and is mapped via enum_map.  If the
+    value is not found in the map, a string like "Unknown(X)" is returned.
     """
     variant_type, cast_fn = _UA_TYPE_MAP[opcua_type]
     try:
+        if opcua_type == "Enum":
+            try:
+                int_val = int(value)
+                value = enum_map.get(int_val, f"Unknown({int_val})") if enum_map else str(int_val)
+            except (ValueError, TypeError):
+                # if it's already a string or bytes that can't be an int,
+                # just pass it through to cast_fn below
+                pass
+
         if isinstance(value, datetime.timedelta):
             if opcua_type == "String":
                 value = str(value)
@@ -393,6 +426,7 @@ class OIDConfig:
     description: str = ""
     lifetime: float = -1.0   # seconds; <0 means "use device default"; 0 means never expire
     poll_every: int = 1       # read this OID every N PLL cycles (1 = every cycle)
+    enum: Optional[Dict[int, str]] = None # mapping for Enum type
 
     @property
     def is_local(self) -> bool:
@@ -405,6 +439,16 @@ class OIDConfig:
                 f"Unknown opcua_type '{self.opcua_type}' for OID {self.oid}. "
                 f"Valid types: {list(_UA_TYPE_MAP)}"
             )
+        # Convert enum keys to int if provided (JSON keys are always strings)
+        if self.enum is not None:
+            try:
+                self.enum = {int(k): str(v) for k, v in self.enum.items()}
+            except (ValueError, TypeError) as exc:
+                raise ValueError(
+                    f"Invalid enum mapping for OID {self.oid}: "
+                    f"keys must be integers (got {exc})"
+                ) from exc
+
         # poll_every < 1 is meaningless — clamp silently to 1 (every cycle).
         if self.poll_every < 1:
             self.poll_every = 1
@@ -500,6 +544,7 @@ class NodeStore:
     next_cycle:       int = 0
     updated_since_write: bool = False
     node:             Optional[Any] = None
+    enum:             Optional[Dict[int, str]] = None
 
 
 
@@ -810,6 +855,7 @@ class SNMPPoller:
                     "description": o.description,
                     "lifetime":    o.lifetime,
                     "poll_every":  o.poll_every,
+                    "enum":        o.enum,
                 }
                 for o in self.oids
             ],
@@ -889,6 +935,7 @@ class SNMPPoller:
                 description=oid_cfg.description,
                 lifetime=effective_lifetime,
                 is_local=oid_cfg.is_local,
+                enum=oid_cfg.enum,
             )
 
         # ── Constants ─────────────────────────────────────────────────────────
@@ -1363,8 +1410,8 @@ class SNMPPoller:
                 continue
 
             val = _snmp_value_to_python(results[key])
-            variant = _cast_to_ua(val, cfg.opcua_type)
             entry = self._store[cfg.opcua_name]
+            variant = _cast_to_ua(val, cfg.opcua_type, enum_map=entry.enum)
 
             if isinstance(variant, ua.Variant):
                 entry.data_value = ua.DataValue(Value=variant, SourceTimestamp=wall_now)
