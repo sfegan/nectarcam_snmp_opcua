@@ -513,9 +513,9 @@ class SNMPPoller:
     (see also ``_BUILTIN_VARIABLE_NAMES``):
       • device_host                     (String)  – IP address of the device
       • device_port                     (UInt16)  – UDP port of the SNMP agent
-      • device_polling_interval         (Double)  – configured poll interval in seconds
-      • device_connection_downtime      (Double)  – seconds since the last successful poll; 0.0 while connected (always Good)
-      • device_connection_uptime        (Double)  – seconds since the device last came online; 0.0 while offline (always Good)
+      • device_polling_interval         (Double)  – configured poll interval in milliseconds
+      • device_connection_downtime      (Double)  – milliseconds since the last successful poll; 0.0 while connected (always Good)
+      • device_connection_uptime        (Double)  – milliseconds since the device last came online; 0.0 while offline (always Good)
       • device_connected   (Boolean) – True when SNMP agent is reachable; never modified by subclasses
       • device_state                    (Int32)   – 0 = offline, 1 = online (may be overridden by subclasses)
 
@@ -842,9 +842,9 @@ class SNMPPoller:
         # ── Built-in server metadata variables ────────────────────────────────
         # order matches _BUILTIN_VARIABLE_NAMES logic
         for name, opcua_type, value, desc in [
-            ("device_host",             "String",  self.host,             "IP address of the SNMP device"),
-            ("device_port",             "UInt16",  self.port,             "UDP port of the SNMP agent"),
-            ("device_polling_interval", "Double",  self.poll_interval,    "Configured poll interval in seconds"),
+            ("device_host",             "String",  self.host,                    "IP address or hostname of the SNMP device"),
+            ("device_port",             "UInt16",  self.port,                    "UDP port of the SNMP agent"),
+            ("device_polling_interval", "Double",  self.poll_interval*1000.0,    "Configured poll interval in milliseconds"),
         ]:
             specs[name] = NodeStore(
                 opcua_type=opcua_type,
@@ -857,8 +857,8 @@ class SNMPPoller:
             )
 
         for name, desc in [
-            ("device_connection_downtime", "Seconds since the last successful poll; 0.0 while connected"),
-            ("device_connection_uptime",   "Seconds since the device last came online; 0.0 while offline"),
+            ("device_connection_downtime", "Milliseconds since the last successful poll; 0.0 while connected"),
+            ("device_connection_uptime",   "Milliseconds since the device last came online; 0.0 while offline"),
         ]:
             specs[name] = NodeStore(
                 opcua_type="Double",
@@ -1288,7 +1288,7 @@ class SNMPPoller:
         if self._last_state_change_at is None:
             self._last_state_change_at = now
 
-        elapsed = round(now - self._last_state_change_at, 1)
+        elapsed = round((now - self._last_state_change_at)*1000.0, 1)
         downtime = elapsed if not is_online else 0.0
         uptime = elapsed if is_online else 0.0
 
@@ -1676,8 +1676,8 @@ class OPCUAServer:
             for poller in self._pollers:
                 store = poller._store
                 online   = store["device_connected"].data_value.Value.Value
-                downtime = store["device_connection_downtime"].data_value.Value.Value
-                uptime   = store["device_connection_uptime"].data_value.Value.Value
+                downtime = store["device_connection_downtime"].data_value.Value.Value*0.001
+                uptime   = store["device_connection_uptime"].data_value.Value.Value*0.001
 
                 num_vars = sum(1 for e in store.values() if e.node is not None)
                 num_oid = len(poller.oids)
@@ -1823,8 +1823,7 @@ def parse_args() -> argparse.Namespace:
             "Path to a JSON file describing one or more device configurations. "
             "The top-level element may be a single object (one device) or an "
             "array (multiple devices). May be specified more than once to load "
-            "several files. When any --device-config is given, EXAMPLE_CONFIGS "
-            "is ignored."
+            "several files. At least one --device-config must be given."
         ),
     )
     p.add_argument(
@@ -1880,46 +1879,8 @@ def parse_args() -> argparse.Namespace:
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# Example / demo  (replace with your real config)
+# Load config files, construct server and pollers, and run
 # ─────────────────────────────────────────────────────────────────────────────
-
-EXAMPLE_CONFIGS = [
-    {
-        "host":          "127.0.0.1",
-        "port":          1161,
-        "community":     "public",
-        "description":   "Local test SNMP agent (net-snmp on localhost)",
-        "opcua_path":    "Localhost",
-        "poll_interval": 10,
-        "oids": [
-            {
-                "oid":         "1.3.6.1.2.1.1.1.0",
-                "opcua_name":  "sysDescr",
-                "opcua_type":  "String",
-                "description": "System description",
-            },
-            {
-                "oid":         "1.3.6.1.2.1.1.3.0",
-                "opcua_name":  "sysUpTime",
-                "opcua_type":  "UInt32",
-                "description": "System uptime (hundredths of a second)",
-            },
-            {
-                "oid":         "1.3.6.1.2.1.1.5.0",
-                "opcua_name":  "sysName",
-                "opcua_type":  "String",
-                "description": "Administratively assigned system name",
-            },
-            {
-                "oid":         "1.3.6.1.2.1.1.6.0",
-                "opcua_name":  "sysLocation",
-                "opcua_type":  "String",
-                "description": "Physical location of the system",
-            },
-        ],
-    },
-]
-
 
 def _expand_multi_ip(cfg: dict) -> List[dict]:
     """Expand multi-IP config into one dict per address."""
@@ -2046,8 +2007,8 @@ async def async_main() -> None:
         configs = load_device_configs(args.device_configs, strip_leading_underscore=args.publish_local_oids)
         log.info("Using %d device config(s) from command-line JSON file(s)", len(configs))
     else:
-        configs = EXAMPLE_CONFIGS
-        log.info("No --device-config given — using built-in EXAMPLE_CONFIGS")
+        log.fatal("No --device-config given — at least one JSON config file must be provided")
+        sys.exit(1)
 
     for cfg in configs:
         try:
