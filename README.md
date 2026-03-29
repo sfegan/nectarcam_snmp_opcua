@@ -4,6 +4,9 @@ OPC UA server bridge for NectarCAM SNMP devices
 
 This project provides an OPC UA server that polls SNMP devices and exposes their OID values as OPC UA variables. It supports monitoring multiple devices with configurable polling intervals and automatic type conversion.
 
+Copyright 2026, Stephen Fegan <sfegan@llr.in2p3.fr>
+Laboratoire Leprince-Ringuet, CNRS/IN2P3, Ecole Polytechnique, Institut Polytechnique de Paris
+
 ## Features
 
 - Polls SNMPv2c devices asynchronously

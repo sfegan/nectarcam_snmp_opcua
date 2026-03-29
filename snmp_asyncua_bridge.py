@@ -3,6 +3,9 @@ snmp_asyncua_bridge.py
 ────────────────────
 SNMP → OPC UA bridge using pysnmp (SNMPv2c) and asyncua.
 
+Copyright 2026, Stephen Fegan <sfegan@llr.in2p3.fr>
+Laboratoire Leprince-Ringuet, CNRS/IN2P3, Ecole Polytechnique, Institut Polytechnique de Paris
+
 Usage
 -----
 python snmp_asyncua_bridge.py --device-config config.json
