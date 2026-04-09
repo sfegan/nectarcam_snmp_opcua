@@ -48,12 +48,13 @@ python snmp_asyncua_bridge.py \
     --opcua-user admin:secret \
     --log-level INFO \
     --log-file bridge.log \
-    --device-config device_localhost.json \
-    --device-config device_x-cisco.in2p3.fr.json
+    -d device_localhost.json \
+    -d device_x-cisco.in2p3.fr.json
 ```
 
 ### Command Line Options
 
+- `-d`, `--device-config`: Path to JSON configuration file (can be specified multiple times).
 - `--opcua-endpoint`: OPC UA server endpoint URL (default: `opc.tcp://0.0.0.0:4840/nectarcam/`)
 - `--opcua-namespace`: OPC UA namespace URI (default: `http://cta-observatory.org/nectarcam/snmpdevices/`)
 - `--opcua-root`: Dot-separated OPC UA path of the container node created above all device objects (default: `SNMPDevices`). Pass an empty string to place devices directly under `Objects/`.
@@ -64,7 +65,7 @@ python snmp_asyncua_bridge.py \
 - `--snmp-retries`: Number of SNMP retries after the first attempt (default: 1). Can be overridden per device in JSON config.
 - `--default-poll-interval`: Default poll interval in seconds applied to every device that does not specify its own `poll_interval` in its JSON config (default: 10.0). Can be overridden per device.
 - `--default-oids-per-get`: Server-wide default for the maximum number of OIDs sent in a single SNMP GET request (default: 0 = unlimited). A positive value causes the OID list to be split into sequential batches of at most that size, which is required by devices that reject multi-OID GETs. Can be overridden per device with `oids_per_get` in the JSON config.
-- `--device-config`: Path to JSON configuration file (can be specified multiple times).
+- `-d`, `--device-config`: Path to JSON configuration file (can be specified multiple times).
 - `--dump-device-config`: Path to a JSON file to write the fully-resolved device configuration just before the event loop starts, then continue running normally. The output is reconstructed from the live poller instances so every field is present with its resolved value: symbolic OIDs are in dotted-decimal, multi-IP entries are fully expanded, and all defaults are filled in. Reloading the file reproduces identical behaviour regardless of CLI defaults.
 - `--publish-local-oids`: Strip leading underscores from local (underscore-prefixed) OID names so they are published as OPC UA variables instead of being kept server-side only. Intended for testing and diagnostics.
 
@@ -200,13 +201,19 @@ The bridge supports polling multiple OIDs into a single OPC UA array variable. T
 
 ### 1. JSON Array of OIDs
 
-Explicitly list the OIDs in a JSON array:
+Explicitly list the OIDs in a JSON array. These can be related but non-sequential items, such as a set of IP statistics counters:
 
 ```json
 {
-  "oid": [ "IF-MIB::ifSpeed.1", "IF-MIB::ifSpeed.2", "IF-MIB::ifSpeed.3" ],
-  "opcua_name": "ifSpeedList",
-  "opcua_type": "UInt32"
+  "oid": [ 
+    "IP-MIB::ipInReceives.0", 
+    "IP-MIB::ipInHdrErrors.0", 
+    "IP-MIB::ipInAddrErrors.0", 
+    "IP-MIB::ipForwDatagrams.0"
+  ],
+  "opcua_name": "ipStats",
+  "opcua_type": "UInt32",
+  "description": "Selected IP statistics counters"
 }
 ```
 
@@ -216,7 +223,7 @@ Use a range expression in a string to automatically expand a sequence of OIDs:
 
 ```json
 {
-  "oid": "IF-MIB::ifSpeed.{1-63}",
+  "oid": "IF-MIB::ifSpeed.{1..63}",
   "opcua_name": "ifSpeedAll",
   "opcua_type": "UInt32"
 }
@@ -228,6 +235,8 @@ Supported range notations include:
 -   `{1,63}` (comma)
 
 The range is expanded at startup, and all generated OIDs are resolved to dotted-decimal notation.
+
+> **Important**: When using large range expansions (e.g. dozens of OIDs), it is often necessary to specify the `oids_per_get` option (either per-device or via `--default-oids-per-get`). Most SNMP servers have a limit on the number of var-binds they can process in a single GET request, and will return an error if this limit is exceeded. Setting `oids_per_get` to a value like `10` or `20` ensures the requests are split into manageable chunks.
 
 **Behaviour**:
 -   The OPC UA variable is created as an array of the specified `opcua_type`.
