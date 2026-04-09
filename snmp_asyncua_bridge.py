@@ -212,7 +212,7 @@ _BUILTIN_VARIABLE_NAMES: frozenset[str] = frozenset({
 })
 
 
-def _make_status_dv(opcua_type: str, status: ua.StatusCode) -> ua.DataValue:
+def _make_status_dv(opcua_type: str, status: ua.StatusCode, is_vector: bool = False) -> ua.DataValue:
     """
     Build a ua.DataValue carrying *status* and a typed zero value for *opcua_type*.
 
@@ -223,7 +223,7 @@ def _make_status_dv(opcua_type: str, status: ua.StatusCode) -> ua.DataValue:
     letting OPC UA clients see the status code.
     """
     variant_type = _UA_TYPE_MAP[opcua_type][0]
-    zero = _UA_TYPE_ZEROS.get(opcua_type, "")
+    zero = [] if is_vector else _UA_TYPE_ZEROS.get(opcua_type, "")
     return ua.DataValue(
         Value=ua.Variant(zero, variant_type),
         StatusCode_=status,
@@ -260,57 +260,45 @@ def _snmp_value_to_python(raw_value: Any) -> Any:
 
 def _cast_to_ua(value: Any, opcua_type: str, enum_map: Optional[Dict[int, str]] = None) -> ua.DataValue | ua.Variant:
     """
-    Cast a Python value to the requested OPC UA Variant.
+    Cast a Python value (or list of values) to the requested OPC UA Variant.
 
     Returns a ua.Variant on success.  On cast failure returns a ua.DataValue
-    with status BadDataEncodingInvalid so OPC UA clients see a proper error
-    status rather than a silently mis-typed String value written to a node
-    that was declared with a different type.
-
-    Special case: when the target type is String and the value is bytes
-    (as returned by _snmp_value_to_python for OctetString), the bytes are
-    decoded to a Python str using UTF-8 with a latin-1 fallback rather than
-    calling str() which would produce the Python repr "b'...'".
-
-    For numeric target types (Float, Double, and integer variants), bytes are
-    also decoded to a string first so that DisplayString OIDs whose values are
-    numeric (e.g. wrpcTemperatureValue = b"41.9375") can be cast correctly.
-    Without this, float(b"41.9375") would raise TypeError.
-
-    datetime.timedelta values (from TimeTicks OIDs) are converted to
-    milliseconds (as a float) for any numeric UA type, or to their str()
-    representation (e.g. "5:23:49.160000") for String.
-
-    When opcua_type is "Enum", the value is assumed to be an integer (or a
-    string/bytes convertible to one) and is mapped via enum_map.  If the
-    value is not found in the map, a string like "Unknown(X)" is returned.
+    with status BadDataEncodingInvalid.
     """
     variant_type, cast_fn = _UA_TYPE_MAP[opcua_type]
-    try:
+
+    def _cast_one(v: Any) -> Any:
         if opcua_type == "Enum":
             try:
-                int_val = int(value)
-                value = enum_map.get(int_val, f"Unknown({int_val})") if enum_map else str(int_val)
+                int_val = int(v)
+                v = enum_map.get(int_val, f"Unknown({int_val})") if enum_map else str(int_val)
             except (ValueError, TypeError):
                 # if it's already a string or bytes that can't be an int,
                 # just pass it through to cast_fn below
                 pass
 
-        if isinstance(value, datetime.timedelta):
+        if isinstance(v, datetime.timedelta):
             if opcua_type == "String":
-                value = str(value)
+                v = str(v)
             else:
-                value = value.total_seconds() * 1000.0
-        elif isinstance(value, (bytes, bytearray)) and opcua_type != "ByteString":
+                v = v.total_seconds() * 1000.0
+        elif isinstance(v, (bytes, bytearray)) and opcua_type != "ByteString":
             try:
-                value = value.decode("utf-8").strip()
+                v = v.decode("utf-8").strip()
             except UnicodeDecodeError:
-                value = value.decode("latin-1").strip()
-        return ua.Variant(cast_fn(value), variant_type)
+                v = v.decode("latin-1").strip()
+        return cast_fn(v) if cast_fn else v
+
+    try:
+        if isinstance(value, list):
+            res = [_cast_one(v) for v in value]
+        else:
+            res = _cast_one(value)
+        return ua.Variant(res, variant_type)
     except (ValueError, TypeError) as exc:
         log.warning("Type cast failed (%s → %s): %s – writing BadDataEncodingInvalid",
                     value, opcua_type, exc)
-        zero = _UA_TYPE_ZEROS.get(opcua_type, "")
+        zero = [] if isinstance(value, list) else _UA_TYPE_ZEROS.get(opcua_type, "")
         return ua.DataValue(
             Value=ua.Variant(zero, variant_type),
             StatusCode_=ua.StatusCode(ua.StatusCodes.BadDataEncodingInvalid),
@@ -322,11 +310,34 @@ def _cast_to_ua(value: Any, opcua_type: str, enum_map: Optional[Dict[int, str]] 
 # ─────────────────────────────────────────────────────────────────────────────
 
 _DOTTED_RE = re.compile(r'^\d+(\.\d+)+$')
+_RANGE_RE = re.compile(r'\{(\d+)(?:-|,|\.\.)(\d+)\}')
 
 
 def _is_dotted(oid: str) -> bool:
     """Return True if *oid* is already in valid dotted-decimal notation."""
     return bool(_DOTTED_RE.match(oid))
+
+
+def expand_oid_range(oid: str) -> list[str]:
+    """
+    Expand an OID string containing a range like '{1-63}' into a list of OIDs.
+    If no range is present, returns a list containing only the original OID.
+    Supports both ascending and descending ranges.
+    """
+    if not isinstance(oid, str):
+        return [oid]
+    match = _RANGE_RE.search(oid)
+    if not match:
+        return [oid]
+
+    start = int(match.group(1))
+    end = int(match.group(2))
+    step = 1 if start <= end else -1
+
+    prefix = oid[:match.start()]
+    suffix = oid[match.end():]
+
+    return [f"{prefix}{i}{suffix}" for i in range(start, end + step, step)]
 
 
 def _resolve_via_snmptranslate(oid: str) -> Optional[str]:
@@ -420,9 +431,9 @@ def resolve_oid_name(oid: str) -> str:
 
 @dataclass
 class OIDConfig:
-    oid: str                  # dotted-decimal or symbolic, e.g. "SNMPv2-MIB::sysName.0"
-                              # Symbolic names are resolved to dotted-decimal in __post_init__
-                              # so the poll loop and OID-key resolver always see numeric OIDs.
+    oid: str | list[str]      # dotted-decimal or symbolic, e.g. "SNMPv2-MIB::sysName.0"
+                              # or a list of OIDs, or a string with a range {n-m}.
+                              # Expanded and resolved to dotted-decimal in __post_init__.
     opcua_name: str           # variable name on OPC UA side; names beginning with "_" are
                               # "local" — polled and stored but not published to OPC UA.
     opcua_type: str           # one of the keys in _UA_TYPE_MAP
@@ -435,6 +446,11 @@ class OIDConfig:
     def is_local(self) -> bool:
         """True when this OID should not be published to OPC UA (name starts with '_')."""
         return self.opcua_name.startswith("_")
+
+    @property
+    def is_vector(self) -> bool:
+        """True when this OID configuration represents a vector of values."""
+        return isinstance(self.oid, list)
 
     def __post_init__(self):
         if self.opcua_type not in _UA_TYPE_MAP:
@@ -455,10 +471,20 @@ class OIDConfig:
         # poll_every < 1 is meaningless — clamp silently to 1 (every cycle).
         if self.poll_every < 1:
             self.poll_every = 1
+
+        # Expansion
+        if isinstance(self.oid, str):
+            expanded = expand_oid_range(self.oid)
+        else:
+            expanded = self.oid
+
         # Resolve symbolic names (e.g. "SNMPv2-MIB::sysName.0") to dotted-decimal
         # once at construction time so the poll loop and OID-key resolver always
         # see numeric OIDs.
-        self.oid = resolve_oid_name(self.oid)
+        if len(expanded) > 1 or isinstance(self.oid, list):
+            self.oid = [resolve_oid_name(o) for o in expanded]
+        else:
+            self.oid = resolve_oid_name(expanded[0])
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -934,7 +960,7 @@ class SNMPPoller:
             effective_lifetime = self.default_lifetime if oid_cfg.lifetime < 0 else oid_cfg.lifetime
             specs[oid_cfg.opcua_name] = NodeStore(
                 opcua_type=oid_cfg.opcua_type,
-                data_value=_make_status_dv(oid_cfg.opcua_type, _waiting),
+                data_value=_make_status_dv(oid_cfg.opcua_type, _waiting, is_vector=oid_cfg.is_vector),
                 description=oid_cfg.description,
                 lifetime=effective_lifetime,
                 is_local=oid_cfg.is_local,
@@ -1064,10 +1090,10 @@ class SNMPPoller:
 
     async def _get_one_chunk(
         self,
-        oid_list: List[OIDConfig],
+        oid_strings: List[str],
     ) -> Optional[Dict[str, Any]]:
         """
-        Fetch exactly the OIDs in *oid_list* in a single SNMP GET request.
+        Fetch exactly the OIDs in *oid_strings* in a single SNMP GET request.
 
         Returns a dict mapping oid_str -> raw_value for every OID that responded
         successfully, or None if the device was unreachable (error_indication set
@@ -1080,11 +1106,11 @@ class SNMPPoller:
         _get_all_oids(), which handles batching according to oids_per_get.
         """
         object_types = [
-            ObjectType(ObjectIdentity(oid_cfg.oid)) for oid_cfg in oid_list
+            ObjectType(ObjectIdentity(o)) for o in oid_strings
         ]
         log.debug("%s  SNMP GET requesting %d OID(s): %s",
-                  self.host, len(oid_list),
-                  ", ".join(o.oid for o in oid_list))
+                  self.host, len(oid_strings),
+                  ", ".join(oid_strings))
         # Re-use the engine and transport target created once; recreating them
         # on every call is heavyweight and leaks resources.
         if self._snmp_engine is None:
@@ -1160,44 +1186,47 @@ class SNMPPoller:
         Parameters
         ----------
         oid_list : List[OIDConfig]
-            The OIDs to request.  Callers build this list from the full
-            ``self.oids`` (force_full) or from the subset that is due this
-            cycle (scheduled poll).
+            The OID configurations to request.
         effective_limit : int
             Maximum number of OIDs per individual GET request.
             0  → send all OIDs in a single request (unlimited).
-            >0 → split *oid_list* into chunks of at most this size; each chunk
+            >0 → split the OID list into chunks of at most this size; each chunk
                  is sent as a separate sequential GET and the results are merged.
 
         Returns a dict mapping oid_str -> raw_value for every OID that
         responded successfully across all batches, or None if the device was
-        unreachable (i.e. _get_one_chunk returned None for any batch — the
-        remaining batches are not sent).
+        unreachable.
         """
-        if effective_limit == 0 or len(oid_list) <= effective_limit:
+        # Flatten all OID strings from the requested OIDConfigs
+        all_oid_strings: List[str] = []
+        for cfg in oid_list:
+            if isinstance(cfg.oid, list):
+                all_oid_strings.extend(cfg.oid)
+            else:
+                all_oid_strings.append(cfg.oid)
+
+        if not all_oid_strings:
+            return {}
+
+        if effective_limit == 0 or len(all_oid_strings) <= effective_limit:
             # Common fast path: everything fits in one request.
-            return await self._get_one_chunk(oid_list)
+            return await self._get_one_chunk(all_oid_strings)
 
         # Batched path: split into chunks and send sequentially.
-        n_chunks = (len(oid_list) + effective_limit - 1) // effective_limit
+        n_chunks = (len(all_oid_strings) + effective_limit - 1) // effective_limit
         log.debug(
             "%s  SNMP GET: splitting %d OID(s) into %d chunk(s) of ≤%d (oids_per_get=%d)",
-            self.host, len(oid_list), n_chunks, effective_limit, effective_limit,
+            self.host, len(all_oid_strings), n_chunks, effective_limit, effective_limit,
         )
         merged: Dict[str, Any] = {}
         for chunk_idx in range(n_chunks):
             start = chunk_idx * effective_limit
-            chunk = oid_list[start : start + effective_limit]
+            chunk = all_oid_strings[start : start + effective_limit]
             log.debug("%s  SNMP GET: sending chunk %d/%d (%d OID(s))",
                       self.host, chunk_idx + 1, n_chunks, len(chunk))
             partial = await self._get_one_chunk(chunk)
             if partial is None:
-                # Device stopped responding mid-batch.  Discard any results from
-                # earlier chunks and return None so _poll_once treats the whole
-                # cycle as a failure — consistent with the single-GET behaviour
-                # where a transport failure always discards the entire cycle.
-                # A warning is raised only when earlier chunks had succeeded, as
-                # that pattern (responded then stopped) is worth flagging.
+                # Device stopped responding mid-batch.
                 if chunk_idx > 0:
                     log.warning(
                         "%s  SNMP GET: chunk %d/%d failed after %d successful chunk(s)"
@@ -1248,30 +1277,34 @@ class SNMPPoller:
             sleep_for = origin + cycle * self.poll_interval - now
             await asyncio.sleep(sleep_for)
 
-    def _resolve_oid_key(self, oid_cfg: OIDConfig, results: Dict[str, Any]) -> Optional[str]:
+    def _resolve_oid_key(self, oid_cfg: OIDConfig, results: Dict[str, Any]) -> Optional[str | List[str]]:
         """
-        Find the exact key string pysnmp used for this OID in a response dict.
+        Find the exact key string(s) pysnmp used for this OID (or vector) in a response dict.
+        Returns a single string for scalars, or a list of strings for vectors.
+        Returns None if any required OID was not in the response.
+        """
+        if not oid_cfg.is_vector:
+            return self._resolve_single_oid_key(oid_cfg.oid, results)
 
-        pysnmp may reformat OID strings (e.g. resolving symbolic names or
-        normalising instance suffixes), so we try several strategies:
-          1. Exact match on the configured dotted-decimal string
-          2. Configured OID with ".0" appended (scalar instance suffix)
-          3. Any key that ends with the configured OID, or vice-versa
-        Returns the matching key, or None if the OID was not in the response.
-        """
-        if oid_cfg.oid in results:
-            log.debug("%s  OID key match (exact): %s", self.host, oid_cfg.oid)
-            return oid_cfg.oid
-        suffixed = oid_cfg.oid.rstrip(".0") + ".0"
+        keys = []
+        for o in oid_cfg.oid:
+            k = self._resolve_single_oid_key(o, results)
+            if k:
+                keys.append(k)
+            else:
+                return None  # whole vector unsupported if one element missing
+        return keys
+
+    def _resolve_single_oid_key(self, oid: str, results: Dict[str, Any]) -> Optional[str]:
+        """Helper for _resolve_oid_key: find a single OID key in results."""
+        if oid in results:
+            return oid
+        suffixed = oid.rstrip(".0") + ".0"
         if suffixed in results:
-            log.debug("%s  OID key match (suffixed .0): %s → %s", self.host, oid_cfg.oid, suffixed)
             return suffixed
         for key in results:
-            if key.endswith("." + oid_cfg.oid) or oid_cfg.oid.endswith("." + key):
-                log.debug("%s  OID key match (suffix boundary): %s → %s", self.host, oid_cfg.oid, key)
+            if key.endswith("." + oid) or oid.endswith("." + key):
                 return key
-        log.debug("%s  OID key not found in response: %s  (available keys: %s)",
-                  self.host, oid_cfg.oid, list(results))
         return None
 
     def _apply_staleness(self, opcua_name: str, entry: "NodeStore", now: float) -> None:
@@ -1287,7 +1320,7 @@ class SNMPPoller:
         -----
         • Never successfully read (timestamp is None):
               Left unchanged — keeps BadWaitingForInitialData.
-        • BadNotSupported: permanent — never overwritten.
+        • BadNotSupported: permanent — never overwrite.
         • Has a prior value, within lifetime (or lifetime == 0):
               status → UncertainLastUsableValue, value preserved.
         • Has a prior value, lifetime expired (lifetime > 0, elapsed > lifetime):
@@ -1312,10 +1345,12 @@ class SNMPPoller:
                     " — marking BadNoCommunication",
                     self.host, self.opcua_path, opcua_name, elapsed, entry.lifetime,
                 )
+                is_vector = isinstance(entry.data_value.Value.Value, list)
+                zero = [] if is_vector else _UA_TYPE_ZEROS.get(entry.opcua_type, "")
                 entry.data_value = ua.DataValue(
                     Value=ua.Variant(
-                        _UA_TYPE_ZEROS.get(entry.opcua_type, ""),
-                        _UA_TYPE_MAP[entry.opcua_type][0],
+                        zero,
+                        entry.data_value.Value.VariantType,
                     ),
                     StatusCode_=_bad_no_comm,
                 )
@@ -1392,14 +1427,12 @@ class SNMPPoller:
             if key:
                 self._oid_key_cache[cfg.opcua_name] = key
             else:
-                log.warning("%s  OID not supported: %s", self.host, cfg.oid)
+                log.warning("%s  OID (or vector element) not supported: %s", self.host, cfg.oid)
                 entry = self._store[cfg.opcua_name]
-                entry.data_value = ua.DataValue(
-                    Value=ua.Variant(_UA_TYPE_ZEROS.get(entry.opcua_type, ""),
-                                     _UA_TYPE_MAP[entry.opcua_type][0]),
-                    StatusCode_=ua.StatusCode(ua.StatusCodes.BadNotSupported),
-                )
-        log.debug("%s  Resolved %d OID keys", self.host, len(self._oid_key_cache))
+                entry.data_value = _make_status_dv(cfg.opcua_type,
+                                                   ua.StatusCode(ua.StatusCodes.BadNotSupported),
+                                                   is_vector=cfg.is_vector)
+        log.debug("%s  Resolved %d OID key entries", self.host, len(self._oid_key_cache))
 
     def _process_snmp_results(self, results: Dict[str, Any], due_oids: List[OIDConfig], force_full: bool) -> None:
         """Store OID values and handle staleness for non-responding due OIDs."""
@@ -1409,10 +1442,27 @@ class SNMPPoller:
 
         for cfg in due_oids:
             key = self._oid_key_cache.get(cfg.opcua_name)
-            if not key or key not in results:
+            if not key:
                 continue
 
-            val = _snmp_value_to_python(results[key])
+            if isinstance(key, list):
+                vals = []
+                missing = []
+                for k in key:
+                    if k in results:
+                        vals.append(_snmp_value_to_python(results[k]))
+                    else:
+                        missing.append(k)
+                if missing:
+                    log.debug("%s  Vector %s missing %d/%d elements: %s",
+                              self.host, cfg.opcua_name, len(missing), len(key), missing)
+                    continue  # will be handled by staleness loop below
+                val = vals
+            else:
+                if key not in results:
+                    continue
+                val = _snmp_value_to_python(results[key])
+
             entry = self._store[cfg.opcua_name]
             variant = _cast_to_ua(val, cfg.opcua_type, enum_map=entry.enum)
 
@@ -1864,7 +1914,7 @@ def parse_args() -> argparse.Namespace:
         help="Number of SNMP retries after the first attempt. Can be overridden per device in JSON config.",
     )
     p.add_argument(
-        "--device-config",
+        "-d", "--device-config",
         metavar="FILE.json",
         action="append",
         dest="device_configs",

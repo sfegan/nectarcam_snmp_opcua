@@ -112,7 +112,11 @@ Each device configuration is a JSON object with the following fields:
 
 Each OID in the `oids` array is a JSON object with:
 
-- `oid` (string): OID identifier, either in dotted-decimal notation (e.g., `"1.3.6.1.2.1.1.1.0"`) or symbolic name (e.g., `"SNMPv2-MIB::sysDescr.0"`). Symbolic names are automatically resolved to numeric form at startup.
+- `oid` (string or array of strings): OID identifier, specified as:
+    - A single string in dotted-decimal notation (e.g., `"1.3.6.1.2.1.1.1.0"`) or symbolic name (e.g., `"SNMPv2-MIB::sysDescr.0"`).
+    - A string containing a range expression like `"{1-63}"`, `"{1,63}"`, or `"{1..63}"` (e.g., `"IF-MIB::ifSpeed.{1-3}"`). This is automatically expanded into a vector of OIDs.
+    - A JSON array of strings (e.g., `["IF-MIB::ifSpeed.1", "IF-MIB::ifSpeed.2"]`).
+  Symbolic names and ranges are automatically resolved and expanded to numeric form at startup. When multiple OIDs are provided, the variable is published to OPC UA as a vector (array) type.
 - `opcua_name` (string): Name of the OPC UA variable. Names beginning with `_` are *local*: polled and stored internally but not published as OPC UA nodes (useful as inputs for derived variables in subclasses).
 - `opcua_type` (string): OPC UA data type. Supported types: `Boolean`, `SByte`, `Byte`, `Int16`, `UInt16`, `Int32`, `UInt32`, `Int64`, `UInt64`, `Float`, `Double`, `String`, `ByteString`, `DateTime`, `Enum`
 - `enum` (object, optional): Mapping for `Enum` type, as an integer-to-string dictionary. When `opcua_type` is `Enum`, the SNMP value is read as an integer, mapped via this table, and published to OPC UA as a `String`. If the integer value is not found in the map, a string like `"Unknown(X)"` is published. Example: `"enum": {"0": "Off", "1": "On"}`.
@@ -190,11 +194,47 @@ By default every OID is read on every poll cycle (`poll_every: 1`). Setting `pol
 }
 ```
 
-**Staleness behaviour with `poll_every > 1`:** only OIDs that were actually requested in a given cycle can be marked `UncertainLastUsableValue`. OIDs not due that cycle are left entirely untouched — their status remains `Good` from the last successful read until they are next polled.
+## Vector OIDs and Range Expansion
 
-**Device going offline:** when the SNMP agent becomes unreachable, all OIDs are immediately marked stale (regardless of `poll_every`) and all per-OID schedules are reset so that every variable is re-read on the next successful cycle. The sub-sampling phase is reset from that point.
+The bridge supports polling multiple OIDs into a single OPC UA array variable. This can be specified in two ways:
 
-**Cycles with no OIDs due:** if a combination of `poll_every` values results in a cycle where no OID is due, the SNMP GET is skipped entirely. `device_connection_downtime` continues to tick and is pushed to OPC UA; all other state is left unchanged.
+### 1. JSON Array of OIDs
+
+Explicitly list the OIDs in a JSON array:
+
+```json
+{
+  "oid": [ "IF-MIB::ifSpeed.1", "IF-MIB::ifSpeed.2", "IF-MIB::ifSpeed.3" ],
+  "opcua_name": "ifSpeedList",
+  "opcua_type": "UInt32"
+}
+```
+
+### 2. Range Expansion
+
+Use a range expression in a string to automatically expand a sequence of OIDs:
+
+```json
+{
+  "oid": "IF-MIB::ifSpeed.{1-63}",
+  "opcua_name": "ifSpeedAll",
+  "opcua_type": "UInt32"
+}
+```
+
+Supported range notations include:
+-   `{1-63}` (hyphen)
+-   `{1..63}` (double dots)
+-   `{1,63}` (comma)
+
+The range is expanded at startup, and all generated OIDs are resolved to dotted-decimal notation.
+
+**Behaviour**:
+-   The OPC UA variable is created as an array of the specified `opcua_type`.
+-   All OIDs in the vector are fetched in the same polling cycle.
+-   If `oids_per_get` is set, each element of the vector counts towards the limit, and the vector may be split across multiple SNMP GET requests.
+-   If any single OID in the vector fails to respond, the entire vector variable is marked stale or Bad.
+-   Staleness logic (`lifetime`) and poll frequency (`poll_every`) apply to the vector as a single unit.
 
 ## Batched GET Requests
 
