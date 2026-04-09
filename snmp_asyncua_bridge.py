@@ -452,6 +452,11 @@ class OIDConfig:
         """True when this OID configuration represents a vector of values."""
         return isinstance(self.oid, list)
 
+    @property
+    def num_oids(self) -> int:
+        """Number of individual OIDs in this configuration entry."""
+        return len(self.oid) if isinstance(self.oid, list) else 1
+
     def __post_init__(self):
         if self.opcua_type not in _UA_TYPE_MAP:
             raise ValueError(
@@ -752,8 +757,15 @@ class SNMPPoller:
     # Current reconnection delay in cycles, used for exponential backoff when
     # the device is offline.
     _reconnection_delay: int = field(default=1, init=False, repr=False)
+    # Total number of successful SNMP GET requests (packets) since the poller started.
+    _success_count: int = field(default=0, init=False, repr=False)
 
     # ─────────────────────────────────────────────────────────────────────────
+
+    @property
+    def total_oids(self) -> int:
+        """Total number of individual OIDs configured for this poller (including vector elements)."""
+        return sum(o.num_oids for o in self.oids)
 
     def __post_init__(self) -> None:
         if self.poll_interval <= 0:
@@ -1134,6 +1146,8 @@ class SNMPPoller:
             log.debug("%s  SNMP GET error: %s", self.host, error_indication)
             return None
 
+        self._success_count += 1
+
         # Agent-level error — one or more var-binds bad, rest may be ok
         if error_status:
             bad_idx = int(error_index) - 1 if error_index else None
@@ -1254,7 +1268,7 @@ class SNMPPoller:
         is skipped entirely.
         """
         log.info("%s  Poller started  path=%s  interval=%.1fs  oids=%d",
-                 self.host, self.opcua_path, self.poll_interval, len(self.oids))
+                 self.host, self.opcua_path, self.poll_interval, self.total_oids)
 
         loop = asyncio.get_running_loop()
         origin = loop.time()
@@ -1497,8 +1511,9 @@ class SNMPPoller:
             return True
 
         if self._was_offline:
+            num_individual = sum(o.num_oids for o in due_oids)
             log.info("%s  Attempting to connect; polling %d OID(s); reconnection delay %.1fs", 
-                     self.host, len(due_oids), self._reconnection_delay*self.poll_interval)
+                     self.host, num_individual, self._reconnection_delay*self.poll_interval)
 
         results = await self._get_all_oids(due_oids, self.oids_per_get)
         if results is None:
@@ -1567,9 +1582,13 @@ class SNMPPoller:
         """
         if self._snmp_engine is not None:
             try:
-                self._snmp_engine.closeDispatcher()
+                # close_dispatcher() is preferred in newer pysnmp versions
+                if hasattr(self._snmp_engine, "close_dispatcher"):
+                    self._snmp_engine.close_dispatcher()
+                else:
+                    self._snmp_engine.closeDispatcher()
             except Exception as exc:
-                log.debug("%s  SnmpEngine.closeDispatcher() raised: %s", self.host, exc)
+                log.debug("%s  SnmpEngine.close_dispatcher() raised: %s", self.host, exc)
             self._snmp_engine = None
             self._transport_target = None
             log.debug("%s  SnmpEngine closed", self.host)
@@ -1678,11 +1697,11 @@ class OPCUAServer:
             poller.oids_per_get = self.default_oids_per_get
         self._pollers.append(poller)
         limit_desc = (
-            "unlimited" if poller.oids_per_get == 0
-            else f"{poller.oids_per_get} OID(s)/GET"
+            f"unlimited OID GET size" if poller.oids_per_get == 0
+            else f"max: {poller.oids_per_get} OIDs/GET"
         )
-        log.info("%s  Registered poller: %s  (oids_per_get: %s)",
-                 poller.host, poller.opcua_path, limit_desc)
+        log.info("%s  Registered poller: %s with %d OIDs (%s)",
+                 poller.host, poller.opcua_path, poller.total_oids, limit_desc)
 
     # ── address space construction ────────────────────────────────────────────
 
@@ -1771,6 +1790,7 @@ class OPCUAServer:
 
     async def _heartbeat(self) -> None:
         """Log a summary for every registered poller at regular intervals."""
+        last_success_counts = {p.opcua_path: p._success_count for p in self._pollers}
         while True:
             await asyncio.sleep(self._HEARTBEAT_INTERVAL)
             for poller in self._pollers:
@@ -1780,14 +1800,18 @@ class OPCUAServer:
                 uptime   = store["device_connection_uptime"].data_value.Value.Value*0.001
 
                 num_vars = sum(1 for e in store.values() if e.node is not None)
-                num_oid = len(poller.oids)
+                num_oid = poller.total_oids
+                successes = poller._success_count
+                delta_successes = successes - last_success_counts.get(poller.opcua_path, 0)
+                last_success_counts[poller.opcua_path] = successes
+
                 if online:
-                    log.info("%s  Heartbeat: %d nodes, %d OIDs in %s  *ONLINE*  uptime=%.1fs",
-                             poller.host, num_vars, num_oid, poller._opcua_node_path, uptime)
+                    log.info("%s  Heartbeat: %d nodes, %d OIDs in %s  *ONLINE*  uptime=%.1fs  (%d successful GETs)",
+                             poller.host, num_vars, num_oid, poller._opcua_node_path, uptime, delta_successes)
                 else:
-                    log.info("%s  Heartbeat: %d nodes, %d OIDs in %s  *OFFLINE*  downtime=%.1fs  reconnection_delay=%.1fs",
+                    log.info("%s  Heartbeat: %d nodes, %d OIDs in %s  *OFFLINE*  downtime=%.1fs  reconnection_delay=%.1fs  (%d successful GETs)",
                              poller.host, num_vars, num_oid, poller._opcua_node_path, downtime, 
-                             poller._reconnection_delay*poller.poll_interval)
+                             poller._reconnection_delay*poller.poll_interval, delta_successes)
 
     # ── main entry point ──────────────────────────────────────────────────────
 
