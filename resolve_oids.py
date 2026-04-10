@@ -54,7 +54,7 @@ import sys
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
 try:
-    from snmp_asyncua_bridge import resolve_oid_name
+    from snmp_asyncua_bridge import resolve_oid_name, expand_oid_range
 except ImportError as _e:
     sys.exit(f"Cannot import snmp_asyncua_bridge: {_e}\n"
              "Ensure resolve_oids.py is in the same directory as snmp_asyncua_bridge.py.")
@@ -174,16 +174,39 @@ def resolve_config(cfg: dict, *, reverse: bool = False) -> tuple[dict, list[str]
         raw = entry.get("oid", "")
 
         if reverse:
-            symbolic, changed = unresolve_oid(raw)
-            if not changed and _is_dotted(raw):
-                warnings.append(
-                    f"Device {device_id!r}, OID entry {i} ({raw!r}): "
-                    "snmptranslate could not resolve this OID — left unchanged"
-                )
-            entry["oid"] = symbolic
+            if isinstance(raw, list):
+                new_oids = []
+                for j, item in enumerate(raw):
+                    symbolic, changed = unresolve_oid(item)
+                    if not changed and _is_dotted(item):
+                        warnings.append(
+                            f"Device {device_id!r}, OID entry {i}, element {j} ({item!r}): "
+                            "snmptranslate could not resolve this OID — left unchanged"
+                        )
+                    new_oids.append(symbolic)
+                entry["oid"] = new_oids
+            else:
+                symbolic, changed = unresolve_oid(raw)
+                if not changed and _is_dotted(raw):
+                    warnings.append(
+                        f"Device {device_id!r}, OID entry {i} ({raw!r}): "
+                        "snmptranslate could not resolve this OID — left unchanged"
+                    )
+                entry["oid"] = symbolic
         else:
+            if isinstance(raw, str):
+                expanded = expand_oid_range(raw)
+            else:
+                expanded = raw
+
             try:
-                entry["oid"] = resolve_oid_name(raw)
+                if isinstance(expanded, list):
+                    if len(expanded) > 1 or isinstance(raw, list):
+                        entry["oid"] = [resolve_oid_name(o) for o in expanded]
+                    else:
+                        entry["oid"] = resolve_oid_name(expanded[0])
+                else:
+                    entry["oid"] = resolve_oid_name(expanded)
             except ValueError as exc:
                 raise ValueError(
                     f"Device {device_id!r}, OID entry {i} ({raw!r}): {exc}"
