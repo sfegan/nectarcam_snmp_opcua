@@ -212,7 +212,7 @@ _BUILTIN_VARIABLE_NAMES: frozenset[str] = frozenset({
 })
 
 
-def _make_status_dv(opcua_type: str, status: ua.StatusCode, is_vector: bool = False) -> ua.DataValue:
+def _make_status_dv(opcua_type: str, status: ua.StatusCode, is_vector: bool = False, timestamp: Optional[datetime.datetime] = None) -> ua.DataValue:
     """
     Build a ua.DataValue carrying *status* and a typed zero value for *opcua_type*.
 
@@ -227,6 +227,7 @@ def _make_status_dv(opcua_type: str, status: ua.StatusCode, is_vector: bool = Fa
     return ua.DataValue(
         Value=ua.Variant(zero, variant_type),
         StatusCode_=status,
+        SourceTimestamp=timestamp,
     )
 
 
@@ -972,7 +973,7 @@ class SNMPPoller:
             effective_lifetime = self.default_lifetime if oid_cfg.lifetime < 0 else oid_cfg.lifetime
             specs[oid_cfg.opcua_name] = NodeStore(
                 opcua_type=oid_cfg.opcua_type,
-                data_value=_make_status_dv(oid_cfg.opcua_type, _waiting, is_vector=oid_cfg.is_vector),
+                data_value=_make_status_dv(oid_cfg.opcua_type, _waiting, is_vector=oid_cfg.is_vector, timestamp=_wall_now),
                 description=oid_cfg.description,
                 lifetime=effective_lifetime,
                 is_local=oid_cfg.is_local,
@@ -982,10 +983,15 @@ class SNMPPoller:
         # ── Constants ─────────────────────────────────────────────────────────
         for const_cfg in self.constants:
             if const_cfg.value is None:
-                dv = _make_status_dv(const_cfg.opcua_type, _waiting)
+                dv = _make_status_dv(const_cfg.opcua_type, _waiting, timestamp=_wall_now)
             else:
                 variant = _cast_to_ua(const_cfg.value, const_cfg.opcua_type)
-                dv = variant if isinstance(variant, ua.DataValue) else ua.DataValue(variant)
+                if isinstance(variant, ua.DataValue):
+                    dv = variant
+                    if dv.SourceTimestamp is None:
+                        dv.SourceTimestamp = _wall_now
+                else:
+                    dv = ua.DataValue(variant, SourceTimestamp=_wall_now)
 
             effective_lifetime = (
                 (0.0 if const_cfg.value is not None else self.default_lifetime)
@@ -1321,7 +1327,7 @@ class SNMPPoller:
                 return key
         return None
 
-    def _apply_staleness(self, opcua_name: str, entry: "NodeStore", now: float) -> None:
+    def _apply_staleness(self, opcua_name: str, entry: "NodeStore", now: float, wall_now: Optional[datetime.datetime] = None) -> None:
         """
         Apply staleness logic to a single store entry that was not refreshed
         this poll cycle.  Mutates ``entry.data_value`` in place.
@@ -1350,6 +1356,9 @@ class SNMPPoller:
         if entry.timestamp is None:
             return   # never successfully read — leave as BadWaitingForInitialData
 
+        if wall_now is None:
+            wall_now = datetime.datetime.now(datetime.timezone.utc)
+
         elapsed = now - entry.timestamp
 
         if entry.lifetime > 0 and elapsed > entry.lifetime:
@@ -1367,6 +1376,7 @@ class SNMPPoller:
                         entry.data_value.Value.VariantType,
                     ),
                     StatusCode_=_bad_no_comm,
+                    SourceTimestamp=wall_now,
                 )
                 entry.updated_since_write = True
         else:
@@ -1376,6 +1386,7 @@ class SNMPPoller:
                 entry.data_value = ua.DataValue(
                     Value=entry.data_value.Value,
                     StatusCode_=_uncertain,
+                    SourceTimestamp=wall_now,
                 )
                 entry.updated_since_write = True
 
@@ -1421,10 +1432,12 @@ class SNMPPoller:
         log.debug("%s  Device OFFLINE (backoff: %d cycles)", self.host, self._reconnection_delay)
 
         # Skip future cycles for all OIDs
+        now = time.monotonic()
+        wall_now = datetime.datetime.now(datetime.timezone.utc)
         for oid_cfg in self.oids:
             entry = self._store[oid_cfg.opcua_name]
             entry.next_cycle = self._polling_cycle + self._reconnection_delay
-            self._apply_staleness(oid_cfg.opcua_name, entry, time.monotonic())
+            self._apply_staleness(oid_cfg.opcua_name, entry, now, wall_now)
 
         self._update_connection_metrics(False)
 
@@ -1435,6 +1448,7 @@ class SNMPPoller:
         self._was_offline = False
         self._last_state_change_at = time.monotonic()
         self._reconnection_delay = 1
+        wall_now = datetime.datetime.now(datetime.timezone.utc)
 
         for cfg in self.oids:
             key = self._resolve_oid_key(cfg, results)
@@ -1445,7 +1459,8 @@ class SNMPPoller:
                 entry = self._store[cfg.opcua_name]
                 entry.data_value = _make_status_dv(cfg.opcua_type,
                                                    ua.StatusCode(ua.StatusCodes.BadNotSupported),
-                                                   is_vector=cfg.is_vector)
+                                                   is_vector=cfg.is_vector,
+                                                   timestamp=wall_now)
         log.debug("%s  Resolved %d OID key entries", self.host, len(self._oid_key_cache))
 
     def _process_snmp_results(self, results: Dict[str, Any], due_oids: List[OIDConfig], force_full: bool) -> None:
@@ -1484,6 +1499,8 @@ class SNMPPoller:
                 entry.data_value = ua.DataValue(Value=variant, SourceTimestamp=wall_now)
             else:
                 entry.data_value = variant  # cast failed (DataValue with Bad status)
+                if entry.data_value.SourceTimestamp is None:
+                    entry.data_value.SourceTimestamp = wall_now
 
             entry.timestamp = now
             entry.updated_since_write = True
@@ -1495,7 +1512,7 @@ class SNMPPoller:
         # Apply staleness only to due OIDs that failed to respond
         for cfg in due_oids:
             if cfg.opcua_name not in responded and self._oid_key_cache.get(cfg.opcua_name):
-                self._apply_staleness(cfg.opcua_name, self._store[cfg.opcua_name], now)
+                self._apply_staleness(cfg.opcua_name, self._store[cfg.opcua_name], now, wall_now)
 
     async def _poll_once(self, force_full: bool = False) -> bool:
         """
