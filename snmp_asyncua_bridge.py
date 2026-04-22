@@ -569,6 +569,9 @@ class NodeStore:
     updated_since_write
                     True when this entry received a fresh value from SNMP in the
                     current _poll_once() cycle.
+    value_rank      OPC UA ValueRank (-1 = scalar, 1 = one-dimension array).
+    array_dimensions
+                    List of dimensions (e.g. [N]) for array variables.
     """
     opcua_type:       str
     data_value:       ua.DataValue
@@ -580,6 +583,8 @@ class NodeStore:
     updated_since_write: bool = False
     node:             Optional[Any] = None
     enum:             Optional[Dict[int, str]] = None
+    value_rank:       int = -1
+    array_dimensions: Optional[List[int]] = None
 
 
 
@@ -978,10 +983,13 @@ class SNMPPoller:
                 lifetime=effective_lifetime,
                 is_local=oid_cfg.is_local,
                 enum=oid_cfg.enum,
+                value_rank=1 if oid_cfg.is_vector else -1,
+                array_dimensions=[oid_cfg.num_oids] if oid_cfg.is_vector else None,
             )
 
         # ── Constants ─────────────────────────────────────────────────────────
         for const_cfg in self.constants:
+            is_vector = isinstance(const_cfg.value, list)
             if const_cfg.value is None:
                 dv = _make_status_dv(const_cfg.opcua_type, _waiting, timestamp=_wall_now)
             else:
@@ -1003,6 +1011,8 @@ class SNMPPoller:
                 description=const_cfg.description,
                 timestamp=_now if const_cfg.value is not None else None,
                 lifetime=effective_lifetime,
+                value_rank=1 if is_vector else -1,
+                array_dimensions=[len(const_cfg.value)] if is_vector else None,
             )
 
         return specs
@@ -1042,6 +1052,11 @@ class SNMPPoller:
                 entry.data_value.Value or ua.Variant(_UA_TYPE_ZEROS[entry.opcua_type], variant_type),
             )
             await var_node.set_writable(False)
+
+            if entry.value_rank != -1:
+                await var_node.write_value_rank(entry.value_rank)
+            if entry.array_dimensions is not None:
+                await var_node.write_array_dimensions(entry.array_dimensions)
 
             # Write initial status if not Good
             if entry.data_value.StatusCode != ua.StatusCodes.Good:
