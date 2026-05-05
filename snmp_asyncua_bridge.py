@@ -226,7 +226,7 @@ def _make_status_dv(opcua_type: str, status: ua.StatusCode, is_vector: bool = Fa
     zero = [] if is_vector else _UA_TYPE_ZEROS.get(opcua_type, "")
     return ua.DataValue(
         Value=ua.Variant(zero, variant_type),
-        StatusCode_=status,
+        StatusCode=status,
         SourceTimestamp=timestamp,
     )
 
@@ -302,7 +302,7 @@ def _cast_to_ua(value: Any, opcua_type: str, enum_map: Optional[Dict[int, str]] 
         zero = [] if isinstance(value, list) else _UA_TYPE_ZEROS.get(opcua_type, "")
         return ua.DataValue(
             Value=ua.Variant(zero, variant_type),
-            StatusCode_=ua.StatusCode(ua.StatusCodes.BadDataEncodingInvalid),
+            StatusCode=ua.StatusCode(ua.StatusCodes.BadDataEncodingInvalid),
         )
 
 
@@ -1392,7 +1392,7 @@ class SNMPPoller:
                         zero,
                         entry.data_value.Value.VariantType,
                     ),
-                    StatusCode_=_bad_no_comm,
+                    StatusCode=_bad_no_comm,
                     SourceTimestamp=wall_now,
                 )
                 entry.updated_since_write = True
@@ -1402,7 +1402,7 @@ class SNMPPoller:
                           self.host, self.opcua_path, opcua_name)
                 entry.data_value = ua.DataValue(
                     Value=entry.data_value.Value,
-                    StatusCode_=_uncertain,
+                    StatusCode=_uncertain,
                     SourceTimestamp=wall_now,
                 )
                 entry.updated_since_write = True
