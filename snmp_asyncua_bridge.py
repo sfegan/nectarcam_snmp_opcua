@@ -765,6 +765,8 @@ class SNMPPoller:
     _reconnection_delay: int = field(default=1, init=False, repr=False)
     # Total number of successful SNMP GET requests (packets) since the poller started.
     _success_count: int = field(default=0, init=False, repr=False)
+    # Callback triggered whenever device_connected state changes.
+    _connection_change_callback: Optional[Callable[[], Any]] = field(default=None, init=False, repr=False)
 
     # ─────────────────────────────────────────────────────────────────────────
 
@@ -1440,6 +1442,8 @@ class SNMPPoller:
             self._was_offline = True
             self._last_state_change_at = time.monotonic()
             self._reconnection_delay = 1
+            if self._connection_change_callback:
+                self._connection_change_callback()
         else:
             max_delay = max(1, int(self.backoff_interval / self.poll_interval))
             self._reconnection_delay = min(max_delay, self._reconnection_delay * 2)
@@ -1463,6 +1467,8 @@ class SNMPPoller:
         self._was_offline = False
         self._last_state_change_at = time.monotonic()
         self._reconnection_delay = 1
+        if self._connection_change_callback:
+            self._connection_change_callback()
         wall_now = datetime.datetime.now(datetime.timezone.utc)
 
         for cfg in self.oids:
@@ -1692,6 +1698,7 @@ class OPCUAServer:
         user: Optional[str] = None,
         password: Optional[str] = None,
         default_oids_per_get: int = 0,
+        system_monitoring: Optional[str] = None,
     ):
         self.endpoint = endpoint
         self.namespace = namespace
@@ -1710,6 +1717,9 @@ class OPCUAServer:
                 f"got {default_oids_per_get!r}"
             )
         self.default_oids_per_get: int = default_oids_per_get
+        self.system_monitoring = system_monitoring
+        self._num_connected_node: Optional[Any] = None
+        self._monitoring_event = asyncio.Event()
 
     def register(self, poller: SNMPPoller) -> None:
         """Register an SNMPPoller with this server."""
@@ -1727,6 +1737,9 @@ class OPCUAServer:
         # resolved value, making dumped configs CLI-independent.
         if poller.oids_per_get < 0:
             poller.oids_per_get = self.default_oids_per_get
+
+        poller._connection_change_callback = lambda: self._monitoring_event.set()
+
         self._pollers.append(poller)
         limit_desc = (
             f"unlimited OID GET size" if poller.oids_per_get == 0
@@ -1816,6 +1829,39 @@ class OPCUAServer:
             log.info("%s  Address space built for %s (%d variable(s))",
                      poller.host, poller.opcua_path, num_vars)
 
+        # ── system monitoring variables ───────────────────────────────────────
+        if self.system_monitoring:
+            mon_parts = self.root_parts + [p for p in self.system_monitoring.split(".") if p]
+            mon_node, mon_path_str = await self._ensure_path(server, ns_idx, mon_parts)
+
+            # Total devices monitored (constant)
+            num_monitored = len(self._pollers)
+            node_id = ua.NodeId(f"{mon_path_str}.num_devices_monitored", ns_idx, ua.NodeIdType.String)
+            var_node = await mon_node.add_variable(
+                node_id,
+                ua.QualifiedName("num_devices_monitored", ns_idx),
+                ua.Variant(num_monitored, ua.VariantType.UInt32)
+            )
+            await var_node.set_writable(False)
+            await var_node.write_attribute(
+                ua.AttributeIds.Description,
+                ua.DataValue(ua.Variant(ua.LocalizedText("Total number of devices being monitored"), ua.VariantType.LocalizedText))
+            )
+
+            # Currently connected devices (dynamic)
+            node_id = ua.NodeId(f"{mon_path_str}.num_devices_connected", ns_idx, ua.NodeIdType.String)
+            self._num_connected_node = await mon_node.add_variable(
+                node_id,
+                ua.QualifiedName("num_devices_connected", ns_idx),
+                ua.Variant(0, ua.VariantType.UInt32)
+            )
+            await self._num_connected_node.set_writable(False)
+            await self._num_connected_node.write_attribute(
+                ua.AttributeIds.Description,
+                ua.DataValue(ua.Variant(ua.LocalizedText("Number of devices currently connected"), ua.VariantType.LocalizedText))
+            )
+            log.info("System monitoring variables created under %s", mon_path_str)
+
     # ── heartbeat ─────────────────────────────────────────────────────────────
 
     _HEARTBEAT_INTERVAL: float = 180.0   # seconds between summary log lines
@@ -1844,6 +1890,43 @@ class OPCUAServer:
                     log.info("%s  Heartbeat: %d nodes, %d OIDs in %s  *OFFLINE*  downtime=%.1fs  reconnection_delay=%.1fs  (%d successful GETs)",
                              poller.host, num_vars, num_oid, poller._opcua_node_path, downtime, 
                              poller._reconnection_delay*poller.poll_interval, delta_successes)
+
+    # ── system monitoring ─────────────────────────────────────────────────────
+
+    _MONITORING_INTERVAL: float = 10.0  # seconds between updates
+
+    async def _monitoring_loop(self) -> None:
+        """Update system-wide monitoring variables periodically."""
+        if self._num_connected_node is None:
+            return
+        # Set initial value
+        num_connected = sum(
+            1 for p in self._pollers
+            if p._store["device_connected"].data_value.Value.Value
+        )
+        await self._num_connected_node.write_value(
+            ua.DataValue(
+                Value=ua.Variant(num_connected, ua.VariantType.UInt32),
+                SourceTimestamp=datetime.datetime.now(datetime.timezone.utc),
+            )
+        )
+        while True:
+            await self._monitoring_event.wait()
+            self._monitoring_event.clear()
+            num_connected = sum(
+                1 for p in self._pollers
+                if p._store["device_connected"].data_value.Value.Value
+            )
+            await self._num_connected_node.write_value(
+                ua.DataValue(
+                    Value=ua.Variant(num_connected, ua.VariantType.UInt32),
+                    SourceTimestamp=datetime.datetime.now(datetime.timezone.utc),
+                )
+            )
+            log.debug("System monitoring: num_devices_connected updated to %d", num_connected)
+            # Optional: a small sleep to batch rapid changes if many devices
+            # connect/disconnect at once
+            await asyncio.sleep(0.5)
 
     # ── main entry point ──────────────────────────────────────────────────────
 
@@ -1897,6 +1980,10 @@ class OPCUAServer:
             tasks.append(
                 asyncio.create_task(self._heartbeat(), name="heartbeat")
             )
+            if self._num_connected_node is not None:
+                tasks.append(
+                    asyncio.create_task(self._monitoring_loop(), name="monitoring")
+                )
             for t in tasks:
                 t.add_done_callback(_task_done)
             log.debug("Launched %d poller task(s): %s",
@@ -2031,6 +2118,16 @@ def parse_args() -> argparse.Namespace:
             "regardless of CLI defaults."
         ),
     )
+    p.add_argument(
+        "--system-monitoring",
+        default=None,
+        metavar="PATH",
+        help=(
+            "Dot-separated OPC UA path (relative to --opcua-root) where system-wide "
+            "monitoring variables (e.g. num_devices_connected) are created. "
+            "If omitted, system monitoring is disabled."
+        ),
+    )
     return p.parse_args()
 
 
@@ -2155,6 +2252,7 @@ async def async_main() -> None:
         user=user,
         password=password,
         default_oids_per_get=args.default_oids_per_get,
+        system_monitoring=args.system_monitoring,
     )
     root_display = args.opcua_root if args.opcua_root else "(none — devices under Objects/)"
     log.info("OPC UA root path: %s", root_display)

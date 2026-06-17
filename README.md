@@ -65,6 +65,7 @@ python snmp_asyncua_bridge.py \
 - `--snmp-retries`: Number of SNMP retries after the first attempt (default: 1). Can be overridden per device in JSON config.
 - `--default-poll-interval`: Default poll interval in seconds applied to every device that does not specify its own `poll_interval` in its JSON config (default: 10.0). Can be overridden per device.
 - `--default-oids-per-get`: Server-wide default for the maximum number of OIDs sent in a single SNMP GET request (default: 0 = unlimited). A positive value causes the OID list to be split into sequential batches of at most that size, which is required by devices that reject multi-OID GETs. Can be overridden per device with `oids_per_get` in the JSON config.
+- `--system-monitoring`: Dot-separated OPC UA path (relative to `--opcua-root`) where system-wide monitoring variables are created. If omitted, system monitoring is disabled.
 - `-d`, `--device-config`: Path to JSON configuration file (can be specified multiple times).
 - `--dump-device-config`: Path to a JSON file to write the fully-resolved device configuration just before the event loop starts, then continue running normally. The output is reconstructed from the live poller instances so every field is present with its resolved value: symbolic OIDs are in dotted-decimal, multi-IP entries are fully expanded, and all defaults are filled in. Reloading the file reproduces identical behaviour regardless of CLI defaults.
 - `--publish-local-oids`: Strip leading underscores from local (underscore-prefixed) OID names so they are published as OPC UA variables instead of being kept server-side only. Intended for testing and diagnostics.
@@ -333,6 +334,10 @@ The bridge creates the following structure in the OPC UA server:
     - `device_connected` (Boolean): True when the SNMP agent is reachable; mirrors the bridge reachability state and is never modified by subclasses
     - `device_state` (Int32): Bridge connection state (0 = offline, 1 = online)
     - `{opcua_name}`: Configured OID and constant variables
+
+- `Objects/{root_path}/{system_monitoring}/` (optional system monitoring container)
+  - `num_devices_monitored` (UInt32): Total number of devices configured in the bridge
+  - `num_devices_connected` (UInt32): Number of devices currently in the online state
 
 For example, with `--opcua-root SNMPDevices` and `opcua_path: "Switch.Monitoring"`, the device variables would be under `Objects/SNMPDevices/Switch/Monitoring/`.
 
