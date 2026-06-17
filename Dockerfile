@@ -11,6 +11,6 @@ COPY . /app
 WORKDIR /app
 
 # Command to run the Python script
-ENTRYPOINT ["python", "snmp_asyncua_bridge.py", "--opcua-endpoint=opc.tcp://0.0.0.0:48060"]
+ENTRYPOINT ["python", "snmp_asyncua_bridge.py", "--opcua-endpoint=opc.tcp://0.0.0.0:48060", "--system-monitoring=Monitoring"]
 CMD ["--device-config", "switches/nectarcam2_controlswitch_resolved.json", "--device-config", "switches/nectarcam2_dataswitches_resolved.json"]
 # ENTRYPOINT ["tail", "-f", "/dev/null"]
