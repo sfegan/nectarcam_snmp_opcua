@@ -1,0 +1,54 @@
+{
+  "host": "10.11.4.20",
+  "community": "public",
+  "description": "NectarCAM2 Control Switch",
+  "opcua_path": "ControlSwitch",
+  "poll_interval": 10,
+  "oids_per_get": 10,
+  "oids": [
+    {
+      "oid": "SNMPv2-MIB::sysDescr.0",
+      "opcua_name": "sysDescr",
+      "opcua_type": "String",
+      "description": "System description"
+    },
+    {
+      "oid": "DISMAN-EVENT-MIB::sysUpTimeInstance",
+      "opcua_name": "sysUpTime",
+      "opcua_type": "String",
+      "description": "System uptime"
+    },
+    {
+      "oid": "SNMPv2-MIB::sysName.0",
+      "opcua_name": "sysName",
+      "opcua_type": "String",
+      "description": "Administratively assigned system name"
+    },
+    {
+      "oid": "IF-MIB::ifSpeed.{1000001..1000028}", 
+      "opcua_name": "ifSpeed",
+      "opcua_type": "UInt32",
+      "description": "Interface speeds in bits per second"
+    },
+    {
+      "oid": "IF-MIB::ifOperStatus.{1000001..1000028}", 
+      "opcua_name": "ifOperStatus",
+      "opcua_type": "Enum",
+      "enum": {"1": "up", "2": "down", "3": "testing", "4": "unknown", "5": "dormant", "6": "notPresent", "7": "lowerLayerDown"},
+      "description": "Operational state of the interfaces"
+    },
+    {
+      "oid": "IF-MIB::ifInDiscards.{1000001..1000028}", 
+      "opcua_name": "ifInDiscards",
+      "opcua_type": "UInt32",
+      "description": "Number of inbound packets chosen to be discarded"
+    }
+    ,
+    {
+      "oid": "IF-MIB::ifOutUcastPkts.{1000001..1000028}", 
+      "opcua_name": "ifOutUcastPkts",
+      "opcua_type": "UInt32",
+      "description": "The total number of packets that higher-level protocols requested be transmitted to a subnetwork-unicast address."
+    }
+  ]
+}

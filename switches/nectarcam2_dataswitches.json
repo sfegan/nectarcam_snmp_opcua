@@ -1,0 +1,64 @@
+{
+  "host": ["10.11.4.31", "10.11.4.32", "10.11.4.33", "10.11.4.34", "10.11.4.35", "10.11.4.36"],
+  "community": "public",
+  "description": "NectarCAM2 Data Switches",
+  "opcua_path": "DataSwitch{instance:d}",
+  "poll_interval": 10,
+  "oids_per_get": 10,
+  "oids": [
+    {
+      "oid": "SNMPv2-MIB::sysDescr.0",
+      "opcua_name": "sysDescr",
+      "opcua_type": "String",
+      "description": "System description"
+    },
+    {
+      "oid": "DISMAN-EVENT-MIB::sysUpTimeInstance",
+      "opcua_name": "sysUpTime",
+      "opcua_type": "String",
+      "description": "System uptime"
+    },
+    {
+      "oid": "SNMPv2-MIB::sysName.0",
+      "opcua_name": "sysName",
+      "opcua_type": "String",
+      "description": "Administratively assigned system name"
+    },
+    {
+      "oid": [ 
+        "IP-MIB::ipInReceives.0", 
+        "IP-MIB::ipInHdrErrors.0", 
+        "IP-MIB::ipInAddrErrors.0", 
+        "IP-MIB::ipForwDatagrams.0", 
+        "IP-MIB::ipInUnknownProtos.0", 
+        "IP-MIB::ipInDiscards.0", 
+        "IP-MIB::ipInDelivers.0",
+        "IP-MIB::ipOutRequests.0",
+        "IP-MIB::ipOutDiscards.0",
+        "IP-MIB::ipOutNoRoutes.0",
+        "IP-MIB::ipReasmReqds.0",
+        "IP-MIB::ipReasmOKs.0",
+        "IP-MIB::ipReasmFails.0",
+        "IP-MIB::ipFragOKs.0",
+        "IP-MIB::ipFragFails.0",
+        "IP-MIB::ipFragCreates.0"
+      ],
+      "opcua_name": "ipStats",
+      "opcua_type": "UInt32",
+      "description": "IP statistics counters"
+    },
+    {
+      "oid": "IF-MIB::ifSpeed.{1..52}", 
+      "opcua_name": "ifSpeed",
+      "opcua_type": "UInt32",
+      "description": "Interface speeds in bits per second"
+    },
+    {
+      "oid": "IF-MIB::ifOperStatus.{1..52}", 
+      "opcua_name": "ifOperStatus",
+      "opcua_type": "Enum",
+      "enum": {"1": "up", "2": "down", "3": "testing", "4": "unknown", "5": "dormant", "6": "notPresent", "7": "lowerLayerDown"},
+      "description": "Operational state of the interfaces"
+    }
+  ]
+}
