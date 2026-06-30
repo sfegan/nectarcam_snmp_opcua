@@ -259,12 +259,24 @@ def _snmp_value_to_python(raw_value: Any) -> Any:
     return raw_value.prettyPrint()
 
 
-def _cast_to_ua(value: Any, opcua_type: str, enum_map: Optional[Dict[int, str]] = None) -> ua.DataValue | ua.Variant:
+def _cast_to_ua(
+    value: Any,
+    opcua_type: str,
+    enum_map: Optional[Dict[int, str]] = None,
+    timestamp: Optional[datetime.datetime] = None,
+) -> ua.DataValue | ua.Variant:
     """
     Cast a Python value (or list of values) to the requested OPC UA Variant.
 
     Returns a ua.Variant on success.  On cast failure returns a ua.DataValue
     with status BadDataEncodingInvalid.
+
+    *timestamp*, if given, is baked into the failure-path DataValue at
+    construction time.  ua.DataValue is an immutable (frozen) dataclass in
+    the asyncua versions this bridge targets, so SourceTimestamp must never
+    be assigned after construction -- doing so raises
+    dataclasses.FrozenInstanceError and (absent a guard) takes down the
+    calling poller task.
     """
     variant_type, cast_fn = _UA_TYPE_MAP[opcua_type]
 
@@ -303,6 +315,7 @@ def _cast_to_ua(value: Any, opcua_type: str, enum_map: Optional[Dict[int, str]] 
         return ua.DataValue(
             Value=ua.Variant(zero, variant_type),
             StatusCode=ua.StatusCode(ua.StatusCodes.BadDataEncodingInvalid),
+            SourceTimestamp=timestamp,
         )
 
 
@@ -995,11 +1008,9 @@ class SNMPPoller:
             if const_cfg.value is None:
                 dv = _make_status_dv(const_cfg.opcua_type, _waiting, timestamp=_wall_now)
             else:
-                variant = _cast_to_ua(const_cfg.value, const_cfg.opcua_type)
+                variant = _cast_to_ua(const_cfg.value, const_cfg.opcua_type, timestamp=_wall_now)
                 if isinstance(variant, ua.DataValue):
                     dv = variant
-                    if dv.SourceTimestamp is None:
-                        dv.SourceTimestamp = _wall_now
                 else:
                     dv = ua.DataValue(variant, SourceTimestamp=_wall_now)
 
@@ -1301,8 +1312,17 @@ class SNMPPoller:
             log.debug("%s  Poller starting slot %d", self.host, cycle + 1)
 
             self._polling_cycle = cycle + 1
-            async with self._poll_lock:
-                await self._poll_once()
+            try:
+                async with self._poll_lock:
+                    await self._poll_once()
+            except asyncio.CancelledError:
+                raise
+            except Exception:
+                # A single poll cycle must never be allowed to permanently kill
+                # this device's poller task. Log with full traceback and keep
+                # the phase-locked loop running -- the next cycle will retry.
+                log.exception("%s  Poll cycle %d raised an unhandled exception "
+                               "-- continuing to next cycle", self.host, cycle + 1)
 
             # Advance cycle to the next future deadline
             cycle += 1
@@ -1514,14 +1534,21 @@ class SNMPPoller:
                 val = _snmp_value_to_python(results[key])
 
             entry = self._store[cfg.opcua_name]
-            variant = _cast_to_ua(val, cfg.opcua_type, enum_map=entry.enum)
+            try:
+                variant = _cast_to_ua(val, cfg.opcua_type, enum_map=entry.enum, timestamp=wall_now)
 
-            if isinstance(variant, ua.Variant):
-                entry.data_value = ua.DataValue(Value=variant, SourceTimestamp=wall_now)
-            else:
-                entry.data_value = variant  # cast failed (DataValue with Bad status)
-                if entry.data_value.SourceTimestamp is None:
-                    entry.data_value.SourceTimestamp = wall_now
+                if isinstance(variant, ua.Variant):
+                    entry.data_value = ua.DataValue(Value=variant, SourceTimestamp=wall_now)
+                else:
+                    entry.data_value = variant  # cast failed (DataValue with Bad status, timestamp already set)
+            except Exception:
+                # Defense in depth: a single malformed/unexpected SNMP value must
+                # never be allowed to crash the whole poller task. Leave the
+                # previous value in place (it will go stale and be marked Bad by
+                # the staleness loop below) and move on to the next OID.
+                log.exception("%s  Unexpected error processing OID %s (value=%r) -- "
+                               "leaving previous value in place", self.host, cfg.opcua_name, val)
+                continue
 
             entry.timestamp = now
             entry.updated_since_write = True
@@ -1962,31 +1989,49 @@ class OPCUAServer:
         async with server:
             log.info("OPC UA server listening on %s", self.endpoint)
 
-            def _task_done(task: asyncio.Task) -> None:
-                # Called when a poller task exits for any reason.
-                # CancelledError is expected on shutdown; anything else is a bug.
-                if task.cancelled():
-                    return
-                exc = task.exception()
-                if exc is not None:
-                    log.error("Poller task %s crashed unexpectedly: %s: %s",
-                              task.get_name(), type(exc).__name__, exc,
-                              exc_info=exc)
+            async def _supervised(coro_factory, name: str, backoff: float = 5.0) -> None:
+                """
+                Run coro_factory() forever, restarting it with a backoff delay
+                if it ever raises. This is the last line of defense: even an
+                unanticipated bug that escapes a component's own internal
+                error handling can no longer take down the rest of the OPC UA
+                server (and, transitively, the whole process). Cancellation
+                (server shutdown) is always allowed to propagate normally.
+                """
+                while True:
+                    try:
+                        await coro_factory()
+                        # A normal return (rather than an infinite loop) ends
+                        # supervision for this task -- nothing left to restart.
+                        return
+                    except asyncio.CancelledError:
+                        raise
+                    except Exception:
+                        log.exception(
+                            "Task %r crashed unexpectedly -- restarting in %.1fs",
+                            name, backoff,
+                        )
+                        await asyncio.sleep(backoff)
 
             tasks = [
-                asyncio.create_task(poller.run(), name=f"poller-{poller.host}")
+                asyncio.create_task(
+                    _supervised(poller.run, f"poller-{poller.host}"),
+                    name=f"poller-{poller.host}",
+                )
                 for poller in self._pollers
             ]
             tasks.append(
-                asyncio.create_task(self._heartbeat(), name="heartbeat")
+                asyncio.create_task(
+                    _supervised(self._heartbeat, "heartbeat"), name="heartbeat"
+                )
             )
             if self._num_connected_node is not None:
                 tasks.append(
-                    asyncio.create_task(self._monitoring_loop(), name="monitoring")
+                    asyncio.create_task(
+                        _supervised(self._monitoring_loop, "monitoring"), name="monitoring"
+                    )
                 )
-            for t in tasks:
-                t.add_done_callback(_task_done)
-            log.debug("Launched %d poller task(s): %s",
+            log.debug("Launched %d supervised task(s): %s",
                       len(tasks), ", ".join(t.get_name() for t in tasks))
             try:
                 await asyncio.gather(*tasks)
