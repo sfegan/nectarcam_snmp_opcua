@@ -91,16 +91,7 @@
         "1.3.6.1.2.1.2.2.1.8.1000028"
       ],
       "opcua_name": "ifOperStatus",
-      "opcua_type": "Enum",
-      "enum": {
-        "1": "up",
-        "2": "down",
-        "3": "testing",
-        "4": "unknown",
-        "5": "dormant",
-        "6": "notPresent",
-        "7": "lowerLayerDown"
-      },
+      "opcua_type": "UInt32",
       "description": "Operational state of the interfaces"
     },
     {
