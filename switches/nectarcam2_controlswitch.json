@@ -33,8 +33,7 @@
     {
       "oid": "IF-MIB::ifOperStatus.{1000001..1000028}", 
       "opcua_name": "ifOperStatus",
-      "opcua_type": "Enum",
-      "enum": {"1": "up", "2": "down", "3": "testing", "4": "unknown", "5": "dormant", "6": "notPresent", "7": "lowerLayerDown"},
+      "opcua_type": "UInt32",
       "description": "Operational state of the interfaces"
     },
     {
