@@ -1,7 +1,7 @@
 {
   "host": "10.11.4.25",
   "community": "public",
-  "description": "NectarCAM White Rabbit Switche",
+  "description": "NectarCAM White Rabbit Switch",
   "opcua_path": "WRSwitch",
   "poll_interval": 10,
   "oids_per_get": 10,
@@ -165,6 +165,39 @@
       "opcua_name": "WrsTemperature",
       "opcua_type": "Int32",
       "description": "Temperature readings from the White Rabbit Switch from the wrsTemperatureGroup. Elements are:\nwrsTempFPGA - FPGA temperature,\nwrsTempPLL - PLL temperature,\nwrsTempPSL - Power Supply Left (PSL) temperature,\nwrsTempPSR - Power Supply Right (PSR) temperature"
+    },
+    {
+      "oid": "WR-SWITCH-MIB::wrsSpllMode.0",
+      "opcua_name": "WrsSpllMode",
+      "opcua_type": "Enum",
+      "enum": {"0": "na", "1": "grandmaster", "2": "master", "3": "slave", "4": "disabled"},
+      "description": "Soft PLL mode"
+    },
+    {
+      "oid": "WR-SWITCH-MIB::wrsSpllSeqState.0",
+      "opcua_name": "WrsSpllSeqState",
+      "opcua_type": "Enum",
+      "enum": {"1": "startExt", "2": "waitExt", "3": "startHelper", "4": "waitHelper", "5": "startMain", "6": "waitMain", "7": "disabled", "8": "ready", "9": "clearDacs", "10": "waitClearDacs"},
+      "description": "Sequence state of Soft PLL"
+    },
+    {
+      "oid": "WR-SWITCH-MIB::wrsSpllAlignState.0",
+      "opcua_name": "WrsSpllAlignState",
+      "opcua_type": "Enum",
+      "enum": {"0": "extOff", "1": "start", "2": "initCsync", "3": "waitCsync", "4": "waitSample", "5": "compensateDelay", "6": "locked", "7": "startAlignment", "8": "startMain", "9": "waitClkIn", "10": "waitPlock"},
+      "description": "Align state of Soft PLL"
+    },
+    {
+      "oid": [
+        "WR-SWITCH-MIB::wrsSpllHlock.0",
+        "WR-SWITCH-MIB::wrsSpllMlock.0",
+        "WR-SWITCH-MIB::wrsSpllHY.0",
+        "WR-SWITCH-MIB::wrsSpllMY.0",
+        "WR-SWITCH-MIB::wrsSpllDelCnt.0"
+      ],
+      "opcua_name": "WrsSpllValues",
+      "opcua_type": "Int32",
+      "description": "Soft PLL values: Hlock, Mlock, H_y, M_y, Del counter"
     }
   ]
 }
