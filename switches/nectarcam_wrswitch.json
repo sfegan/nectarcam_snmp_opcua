@@ -158,7 +158,7 @@
         "WR-SWITCH-MIB::wrsTempPSR.0"
         ],
       "opcua_name": "wrsTemperature",
-      "opcua_type": "Integer32",
+      "opcua_type": "Int32",
       "description": "Temperature readings from the White Rabbit Switch from the wrsTemperatureGroup. Elements are:\nwrsTempFPGA - FPGA temperature,\nwrsTempPLL - PLL temperature,\nwrsTempPSL - Power Supply Left (PSL) temperature,\nwrsTempPSR - Power Supply Right (PSR) temperature"
     }
   ]
