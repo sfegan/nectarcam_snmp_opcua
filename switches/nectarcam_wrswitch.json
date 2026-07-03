@@ -8,77 +8,77 @@
   "oids": [
     {
       "oid": "SNMPv2-MIB::sysDescr.0",
-      "opcua_name": "sysDescr",
+      "opcua_name": "SysDescr",
       "opcua_type": "String",
       "description": "System description",
       "poll_every": 30
     },
     {
       "oid": "DISMAN-EVENT-MIB::sysUpTimeInstance",
-      "opcua_name": "sysUpTime",
+      "opcua_name": "SysUpTime",
       "opcua_type": "String",
       "description": "System uptime"
     },
     {
       "oid": "SNMPv2-MIB::sysName.0",
-      "opcua_name": "sysName",
+      "opcua_name": "SysName",
       "opcua_type": "String",
       "description": "Administratively assigned system name",
       "poll_every": 30
     },
     {
       "oid": "IF-MIB::ifName.{1..20}", 
-      "opcua_name": "ifName",
+      "opcua_name": "IfName",
       "opcua_type": "String",
       "description": "Interface name",
       "poll_every": 30
     },
     {
       "oid": "IF-MIB::ifSpeed.{1..20}", 
-      "opcua_name": "ifSpeed",
+      "opcua_name": "IfSpeed",
       "opcua_type": "UInt32",
       "description": "Interface speeds in bits per second"
     },
     {
       "oid": "IF-MIB::ifOperStatus.{1..20}", 
-      "opcua_name": "ifOperStatus",
+      "opcua_name": "IfOperStatus",
       "opcua_type": "Enum",
       "enum": {"1": "up", "2": "down", "3": "testing", "4": "unknown", "5": "dormant", "6": "notPresent", "7": "lowerLayerDown"},
       "description": "Operational state of the interfaces"
     },
     {
       "oid": "IF-MIB::ifInOctets.{1..20}", 
-      "opcua_name": "ifHCInOctets",
+      "opcua_name": "IfHCInOctets",
       "opcua_type": "UInt64",
       "description": "Number of octets received on the interface"
     },
     {
       "oid": "IF-MIB::ifInDiscards.{1..20}", 
-      "opcua_name": "ifInDiscards",
+      "opcua_name": "IfInDiscards",
       "opcua_type": "UInt32",
       "description": "Number of inbound packets chosen to be discarded"
     },
     {
       "oid": "IF-MIB::ifInErrors.{1..20}", 
-      "opcua_name": "ifInErrors",
+      "opcua_name": "IfInErrors",
       "opcua_type": "UInt32",
       "description": "Number of inbound packets with errors"
     },
     {
       "oid": "IF-MIB::ifOutOctets.{1..20}", 
-      "opcua_name": "ifHCOutOctets",
+      "opcua_name": "IfHCOutOctets",
       "opcua_type": "UInt64",
       "description": "Number of octets transmitted on the interface"
     },
     {
       "oid": "IF-MIB::ifOutDiscards.{1..20}", 
-      "opcua_name": "ifOutDiscards",
+      "opcua_name": "IfOutDiscards",
       "opcua_type": "UInt32",
       "description": "Number of outbound packets chosen to be discarded"
     },
     {
       "oid": "IF-MIB::ifOutErrors.{1..20}", 
-      "opcua_name": "ifOutErrors",
+      "opcua_name": "IfOutErrors",
       "opcua_type": "UInt32",
       "description": "Number of outbound packets with errors"
     },
@@ -89,7 +89,7 @@
           "WR-SWITCH-MIB::wrsTimingStatus.0",
           "WR-SWITCH-MIB::wrsNetworkingStatus.0"
         ],
-      "opcua_name": "wrsGeneralStatus",
+      "opcua_name": "WrsGeneralStatus",
       "opcua_type": "Enum",
       "enum": {"0": "na", "1": "ok", "2": "error", "3": "warning", "4": "warningNA", "5": "bug"},
       "description": "General status of the White Rabbit Switch from the wrsGeneralStatusGroup. Elements are:\nwrsMainSystemStatus - Grouped status of WRS switch,\nwrsOSStatus - Grouped status of wrsOSStatusGroup,\nwrsTimingStatus - Grouped status of wrsTimingStatusGroup,\nwrsNetworkingStatus - Grouped status of wrsNetworkingStatusGroup"
@@ -102,7 +102,7 @@
           "WR-SWITCH-MIB::wrsPTPFramesFlowing.0",
           "WR-SWITCH-MIB::wrsSystemClockStatus.0"
         ],
-      "opcua_name": "wrsTimingStatus",
+      "opcua_name": "WrsTimingStatus",
       "opcua_type": "Enum",
       "enum": {"0": "na", "1": "ok", "2": "error", "3": "warning", "4": "warningNA", "5": "bug", "6": "firstRead"},
       "description": "Status of the timing system from the wrsTimingStatusGroup. Elements are:\nwrsPTPStatus - Grouped status of PTP daemon based on values in wrsPtpDataTable,\nwrsSoftPLLStatus - Grouped status of Soft PLL based on values in wrsSpllState,\nwrsSlaveLinksStatus - Grouped status of slave links,\nwrsPTPFramesFlowing - Grouped status of TX and RX PTP packets flowing,\nwrsSystemClockStatus - Grouped status of system clock"
@@ -114,40 +114,40 @@
           "WR-SWITCH-MIB::wrsSwcoreStatus.0",
           "WR-SWITCH-MIB::wrsRTUStatus.0"
         ],
-      "opcua_name": "wrsNetworkingStatus",
+      "opcua_name": "WrsNetworkingStatus",
       "opcua_type": "Enum",
       "enum": {"0": "na", "1": "ok", "2": "error", "3": "warning", "4": "warningNA", "5": "bug", "6": "firstRead"},
       "description": "Status of the networking system from the wrsNetworkingStatusGroup. Elements are:\nwrsSFPsStatus - Grouped status of SFPs,\nwrsEndpointStatus - Grouped status of all endpoints,\nwrsSwcoreStatus - Overall status of Soft Core,\nwrsRTUStatus - RTU status"
     },
     {
       "oid": "WR-SWITCH-MIB::wrsVersionSwVersion.0",
-      "opcua_name": "wrsVersionSwVersion",
+      "opcua_name": "WrsVersionSwVersion",
       "opcua_type": "String",
       "description": "The software version, as returned from 'git describe' at build time",
       "poll_every": 30
     },
     {
       "oid": "WR-SWITCH-MIB::wrsDateTAI.0",
-      "opcua_name": "wrsDateTAI",
+      "opcua_name": "WrsDateTAI",
       "opcua_type": "UInt64",
       "description": "The current TAI time in seconds since 1970-01-01 00:00:00"
     },
     {
       "oid": "WR-SWITCH-MIB::wrsDateTAIString.0",
-      "opcua_name": "wrsDateTAIString",
+      "opcua_name": "WrsDateTAIString",
       "opcua_type": "String",
       "description": "The current TAI time as a string in format YYYY-MM-DD-HH:MM:SS"
     },
     {
       "oid": "WR-SWITCH-MIB::wrsSystemClockStatusDetails.0",
-      "opcua_name": "wrsSystemClockStatusDetails",
+      "opcua_name": "WrsSystemClockStatusDetails",
       "opcua_type": "Enum",
       "enum": {"0": "na", "1": "ok", "2": "thresholdExceeded", "3": "ntpError", "4": "error", "5": "ioError", "6": "unknownStatus"},
       "description": "The system clock is compared to NTP time"
     },
     {
       "oid": "WR-SWITCH-MIB::wrsLeapSecStatusDetails.0",
-      "opcua_name": "wrsLeapSecStatusDetails",
+      "opcua_name": "WrsLeapSecStatusDetails",
       "opcua_type": "Enum",
       "enum": {"0": "na", "1": "ok", "2": "statusFileMissing", "3": "unknownStatus", 
         "4": "leapSecFileExpired", "5": "internalErrorDetected", "6": "taiReadError", 
@@ -162,7 +162,7 @@
         "WR-SWITCH-MIB::wrsTempPSL.0",
         "WR-SWITCH-MIB::wrsTempPSR.0"
         ],
-      "opcua_name": "wrsTemperature",
+      "opcua_name": "WrsTemperature",
       "opcua_type": "Int32",
       "description": "Temperature readings from the White Rabbit Switch from the wrsTemperatureGroup. Elements are:\nwrsTempFPGA - FPGA temperature,\nwrsTempPLL - PLL temperature,\nwrsTempPSL - Power Supply Left (PSL) temperature,\nwrsTempPSR - Power Supply Right (PSR) temperature"
     }
