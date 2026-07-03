@@ -10,7 +10,8 @@
       "oid": "SNMPv2-MIB::sysDescr.0",
       "opcua_name": "sysDescr",
       "opcua_type": "String",
-      "description": "System description"
+      "description": "System description",
+      "poll_every": 30
     },
     {
       "oid": "DISMAN-EVENT-MIB::sysUpTimeInstance",
@@ -22,13 +23,15 @@
       "oid": "SNMPv2-MIB::sysName.0",
       "opcua_name": "sysName",
       "opcua_type": "String",
-      "description": "Administratively assigned system name"
+      "description": "Administratively assigned system name",
+      "poll_every": 30
     },
     {
       "oid": "IF-MIB::ifName.{1..20}", 
       "opcua_name": "ifName",
       "opcua_type": "String",
-      "description": "Interface name"
+      "description": "Interface name",
+      "poll_every": 30
     },
     {
       "oid": "IF-MIB::ifSpeed.{1..20}", 
@@ -120,7 +123,8 @@
       "oid": "WR-SWITCH-MIB::wrsVersionSwVersion.0",
       "opcua_name": "wrsVersionSwVersion",
       "opcua_type": "String",
-      "description": "The software version, as returned from 'git describe' at build time"
+      "description": "The software version, as returned from 'git describe' at build time",
+      "poll_every": 30
     },
     {
       "oid": "WR-SWITCH-MIB::wrsDateTAI.0",
@@ -148,7 +152,8 @@
       "enum": {"0": "na", "1": "ok", "2": "statusFileMissing", "3": "unknownStatus", 
         "4": "leapSecFileExpired", "5": "internalErrorDetected", "6": "taiReadError", 
         "7": "leaSecInserted", "8": "leapSecDeleted"},
-      "description": "Leap second status"
+      "description": "Leap second status",
+      "poll_every": 30
     },
     {
       "oid": [
