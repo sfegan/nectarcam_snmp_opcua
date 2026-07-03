@@ -42,7 +42,7 @@
       "opcua_type": "Enum",
       "enum": {"1": "up", "2": "down", "3": "testing", "4": "unknown", "5": "dormant", "6": "notPresent", "7": "lowerLayerDown"},
       "description": "Operational state of the interfaces"
-    }
+    },
     {
       "oid": "IF-MIB::ifInOctets.{1..20}", 
       "opcua_name": "ifHCInOctets",
@@ -89,11 +89,7 @@
       "opcua_name": "wrsGeneralStatus",
       "opcua_type": "Enum",
       "enum": {"0": "na", "1": "ok", "2": "error", "3": "warning", "4": "warningNA", "5": "bug"},
-      "description": "General status of the White Rabbit Switch from the wrsGeneralStatusGroup. Elements are:
-            wrsMainSystemStatus - Grouped status of WRS switch,
-            wrsOSStatus - Grouped status of wrsOSStatusGroup
-            wrsTimingStatus - Grouped status of wrsTimingStatusGroup,
-            wrsNetworkingStatus - Grouped status of wrsNetworkingStatusGroup"
+      "description": "General status of the White Rabbit Switch from the wrsGeneralStatusGroup. Elements are:\nwrsMainSystemStatus - Grouped status of WRS switch,\nwrsOSStatus - Grouped status of wrsOSStatusGroup,\nwrsTimingStatus - Grouped status of wrsTimingStatusGroup,\nwrsNetworkingStatus - Grouped status of wrsNetworkingStatusGroup"
     },
     {
       "oid": [ 
@@ -106,35 +102,26 @@
       "opcua_name": "wrsTimingStatus",
       "opcua_type": "Enum",
       "enum": {"0": "na", "1": "ok", "2": "error", "3": "warning", "4": "warningNA", "5": "bug", "6": "firstRead"},
-      "description": "Status of the timing system from the wrsTimingStatusGroup. Elements are:
-            wrsPTPStatus - Grouped status of PTP daemon based on values in wrsPtpDataTable,
-            wrsSoftPLLStatus - Grouped status of Soft PLL based on values in wrsSpllState,
-            wrsSlaveLinksStatus - Grouped status of slave links,
-            wrsPTPFramesFlowing - Grouped status of TX and RX PTP packets flowing,
-            wrsSystemClockStatus - Grouped status of system clock"
+      "description": "Status of the timing system from the wrsTimingStatusGroup. Elements are:\nwrsPTPStatus - Grouped status of PTP daemon based on values in wrsPtpDataTable,\nwrsSoftPLLStatus - Grouped status of Soft PLL based on values in wrsSpllState,\nwrsSlaveLinksStatus - Grouped status of slave links,\nwrsPTPFramesFlowing - Grouped status of TX and RX PTP packets flowing,\nwrsSystemClockStatus - Grouped status of system clock"
     },
     {
       "oid": [ 
           "WR-SWITCH-MIB::wrsSFPsStatus.0",
           "WR-SWITCH-MIB::wrsEndpointStatus.0",
           "WR-SWITCH-MIB::wrsSwcoreStatus.0",
-          "WR-SWITCH-MIB::wrsRTUStatus.0",
+          "WR-SWITCH-MIB::wrsRTUStatus.0"
         ],
       "opcua_name": "wrsNetworkingStatus",
       "opcua_type": "Enum",
       "enum": {"0": "na", "1": "ok", "2": "error", "3": "warning", "4": "warningNA", "5": "bug", "6": "firstRead"},
-      "description": "Status of the networking system from the wrsNetworkingStatusGroup. Elements are:
-            wrsSFPsStatus - Grouped status of SFPs,
-            wrsEndpointStatus - Grouped status of all endpoints,
-            wrsSwcoreStatus - Overall status of Soft Core,
-            wrsRTUStatus - RTU status"
+      "description": "Status of the networking system from the wrsNetworkingStatusGroup. Elements are:\nwrsSFPsStatus - Grouped status of SFPs,\nwrsEndpointStatus - Grouped status of all endpoints,\nwrsSwcoreStatus - Overall status of Soft Core,\nwrsRTUStatus - RTU status"
     },
     {
       "oid": "WR-SWITCH-MIB::wrsVersionSwVersion.0",
       "opcua_name": "wrsVersionSwVersion",
       "opcua_type": "String",
       "description": "The software version, as returned from 'git describe' at build time"
-    }
+    },
     {
       "oid": "WR-SWITCH-MIB::wrsVersionHwVersion.0",
       "opcua_name": "wrsVersionHwVersion",
@@ -178,11 +165,7 @@
         ],
       "opcua_name": "wrsTemperature",
       "opcua_type": "Integer32",
-      "description": "Temperature readings from the White Rabbit Switch from the wrsTemperatureGroup. Elements are:
-            wrsTempFPGA - FPGA temperature,
-            wrsTempPLL - PLL temperature,
-            wrsTempPSL - Power Supply Left (PSL) temperature,
-            wrsTempPSR - Power Supply Right (PSR) temperature"
+      "description": "Temperature readings from the White Rabbit Switch from the wrsTemperatureGroup. Elements are:\nwrsTempFPGA - FPGA temperature,\nwrsTempPLL - PLL temperature,\nwrsTempPSL - Power Supply Left (PSL) temperature,\nwrsTempPSR - Power Supply Right (PSR) temperature"
     }
   ]
 }
