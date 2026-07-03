@@ -1,5 +1,5 @@
 {
-  "host": ["10.11.4.25"],
+  "host": "10.11.4.25",
   "community": "public",
   "description": "NectarCAM White Rabbit Switche",
   "opcua_path": "WRSwitch",
@@ -121,12 +121,6 @@
       "opcua_name": "wrsVersionSwVersion",
       "opcua_type": "String",
       "description": "The software version, as returned from 'git describe' at build time"
-    },
-    {
-      "oid": "WR-SWITCH-MIB::wrsVersionHwVersion.0",
-      "opcua_name": "wrsVersionHwVersion",
-      "opcua_type": "String",
-      "description": "The hardware version, as returned from 'git describe' at build time"
     },
     {
       "oid": "WR-SWITCH-MIB::wrsDateTAI.0",
