@@ -37,7 +37,8 @@
       "oid": "IF-MIB::ifSpeed.{1..20}", 
       "opcua_name": "IfSpeed",
       "opcua_type": "UInt32",
-      "description": "Interface speeds in bits per second"
+      "description": "Interface speeds in bits per second",
+      "poll_every": 30
     },
     {
       "oid": "IF-MIB::ifOperStatus.{1..20}", 
@@ -184,7 +185,7 @@
       "oid": "WR-SWITCH-MIB::wrsSpllAlignState.0",
       "opcua_name": "WrsSpllAlignState",
       "opcua_type": "Enum",
-      "enum": {"0": "extOff", "1": "start", "2": "initCsync", "3": "waitCsync", "4": "waitSample", "5": "compensateDelay", "6": "locked", "7": "startAlignment", "8": "startMain", "9": "waitClkIn", "10": "waitPlock"},
+        "enum": {"0": "extOff", "1": "start", "2": "initCsync", "3": "waitCsync", "4": "waitSample", "5": "compensateDelay", "6": "locked", "7": "startAlignment", "8": "startMain", "9": "waitClkIn", "10": "waitPlock"},
       "description": "Align state of Soft PLL"
     },
     {
@@ -198,6 +199,54 @@
       "opcua_name": "WrsSpllValues",
       "opcua_type": "Int32",
       "description": "Soft PLL values: Hlock, Mlock, H_y, M_y, Del counter"
-    }
+    },
+    {
+      "oid": "WR-SWITCH-MIB::wrsPortStatusPortName.{1..18}", 
+      "opcua_name": "WrsPortStatusPortName",
+      "opcua_type": "String",
+      "description": "Name of port",
+      "poll_every": 30
+    },
+    {
+      "oid": "WR-SWITCH-MIB::wrsPortStatusLink.{1..18}", 
+      "opcua_name": "WrsPortStatusLink",
+      "opcua_type": "Enum",
+      "enum": {"0": "na", "1": "down", "2": "up"},
+      "description": "Whether the link is up or down"
+    },
+    {
+      "oid": "WR-SWITCH-MIB::wrsPortStatusConfiguredMode.{1..18}", 
+      "opcua_name": "WrsPortStatusConfiguredMode",
+      "opcua_type": "Enum",
+      "enum": {"0": "unknown", "1": "master", "2": "slave", "3": "nonWr", "4": "auto", "5": "none"},
+      "description": "Whether the port is configured as master, slave, non-wr or auto",
+      "poll_every": 30
+    },
+    {
+      "oid": "WR-SWITCH-MIB::wrsPortStatusLocked.{1..18}", 
+      "opcua_name": "WrsPortStatusLocked",
+      "opcua_type": "Enum",
+      "enum": {"0": "na", "1": "notLocked", "2": "locked"},
+      "description": "Whether the peers are locked or not"
+    },
+    {
+      "oid": "WR-SWITCH-MIB::wrsPortStatusSfpError.{1..18}", 
+      "opcua_name": "WrsPortStatusSfpError",
+      "opcua_type": "Enum",
+      "enum": {"0": "na", "1": "sfpOk", "2": "sfpError", "3": "portDown"},
+      "description": "Problem with SFP configuration. Port has to be always 1GbE. Port has to be in data base as long as support WR"
+    },
+    {
+      "oid": "WR-SWITCH-MIB::wrsPortStatusPtpTxFrames.{1..18}", 
+      "opcua_name": "WrsPortStatusPtpTxFrames",
+      "opcua_type": "UInt32",
+      "description": "Number of transmitted PTP frames per port (for all PPSI instances running on particular port"
+    },
+    {
+      "oid": "WR-SWITCH-MIB::wrsPortStatusPtpRxFrames.{1..18}", 
+      "opcua_name": "WrsPortStatusPtpRxFrames",
+      "opcua_type": "UInt32",
+      "description": "Number of received PTP frames per port (for all PPSI instances running on particular port"
+    }    
   ]
 }
