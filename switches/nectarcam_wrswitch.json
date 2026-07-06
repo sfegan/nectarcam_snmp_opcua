@@ -14,7 +14,7 @@
       "poll_every": 30
     },
     {
-      "oid": "DISMAN-EVENT-MIB::sysUpTimeInstance",
+      "oid": "SNMPv2-MIB::sysUpTime.0",
       "opcua_name": "SysUpTime",
       "opcua_type": "String",
       "description": "System uptime"
@@ -247,6 +247,6 @@
       "opcua_name": "WrsPortStatusPtpRxFrames",
       "opcua_type": "UInt32",
       "description": "Number of received PTP frames per port (for all PPSI instances running on particular port"
-    }    
+    }
   ]
 }
